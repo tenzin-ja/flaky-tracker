@@ -19,47 +19,54 @@ pull requests so developers know whether a failure is their fault.
 
 ## Tech stack
 
-Python · FastAPI · PostgreSQL · SQLAlchemy 2 · Alembic · httpx · Docker ·
-GitHub Actions · AWS
+- **App:** Python 3.13 · Django · Celery · Redis · PostgreSQL
+- **GitHub integration:** GitHub App webhooks and REST API (httpx, PyJWT)
+- **Tooling:** uv · Ruff · mypy · pytest
+- **Delivery:** Docker · GitHub Actions · Terraform · AWS (ECS Fargate, RDS,
+  ElastiCache, ECR, Secrets Manager, CloudWatch) · Sentry
 
 ## Local development
 
-Requirements: Python 3.12+, Docker.
+Requirements: [uv](https://docs.astral.sh/uv/) and Docker.
 
 ```bash
-# 1. Start PostgreSQL (creates the dev and test databases)
+# 1. Start PostgreSQL and Redis
 docker compose up -d
 
-# 2. Create a virtual environment and install dependencies
-python -m venv .venv
-source .venv/bin/activate        # Windows PowerShell: .\.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
+# 2. Install dependencies (creates .venv from uv.lock)
+uv sync
 
-# 3. Configure environment variables
+# 3. Configure environment variables, then set DJANGO_SECRET_KEY in .env
 cp .env.example .env             # Windows PowerShell: Copy-Item .env.example .env
 
-# 4. Apply migrations and run the API
-alembic upgrade head
-uvicorn app.main:app --reload    # http://localhost:8000/healthz
+# 4. Apply migrations and run the web server
+uv run python manage.py migrate
+uv run python manage.py runserver     # http://localhost:8000/healthz
 
-# 5. Run checks
-pytest
-ruff check . && ruff format --check .
+# 5. Run a Celery worker (separate terminal)
+uv run celery -A config worker --loglevel=info
+
+# 6. Run checks
+uv run pytest
+uv run ruff check . && uv run ruff format --check .
+uv run mypy .
 ```
+
+On Windows, Celery's default worker pool isn't supported; add `--pool=solo` when
+running the worker outside Docker.
 
 ## Project layout
 
 ```text
-app/
-  config.py      Settings loaded from environment variables
-  db.py          Database engine and sessions
-  main.py        FastAPI app
-  models/        SQLAlchemy models
-migrations/      Alembic migrations
-tests/
+config/          Django project: settings, URLs, Celery app, WSGI
+core/            Shared pieces (health check)
+tests/           pytest suite
   fixtures/      Sample JUnit XML reports used by parser tests
-docker/          Local database init script
+docs/rfcs/       Design decisions (RFCs)
 ```
+
+Feature apps (webhooks, ingestion, detection, comments) are added milestone by
+milestone; see [RFC 0001](docs/rfcs/0001-flaky-tracker-v1.md).
 
 ## License
 
