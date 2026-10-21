@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="3" failures="1">
+  <testsuite name="github.com/example/svc/store" tests="3" failures="1" errors="0" id="0" hostname="runner-2" time="0.020" timestamp="2026-10-20T04:20:11Z">
+    <properties>
+      <property name="go.version" value="go1.25.1"></property>
+    </properties>
+    <testcase name="TestPut" classname="github.com/example/svc/store" time="0.000"></testcase>
+    <testcase name="TestGetTimeout" classname="github.com/example/svc/store" time="0.010">
+      <failure message="Failed" type="">    store_test.go:42: context deadline exceeded</failure>
+    </testcase>
+    <testcase name="TestDelete" classname="github.com/example/svc/store" time="0.000"></testcase>
+  </testsuite>
+</testsuites>

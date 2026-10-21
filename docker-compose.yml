@@ -1,0 +1,21 @@
+# Local development database. Usage: docker compose up -d
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: flaky
+      POSTGRES_PASSWORD: flaky
+      POSTGRES_DB: flaky_tracker
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./docker/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flaky -d flaky_tracker"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

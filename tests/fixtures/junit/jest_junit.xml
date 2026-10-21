@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="jest tests" tests="3" failures="1" errors="0" time="1.204">
+  <testsuite name="cart" errors="0" failures="1" skipped="0" timestamp="2026-10-20T04:12:44" time="0.812" tests="3">
+    <testcase classname="cart adds an item" name="cart adds an item" time="0.004" file="src/cart.test.ts">
+    </testcase>
+    <testcase classname="cart applies a discount code" name="cart applies a discount code" time="0.301" file="src/cart.test.ts">
+      <failure>Error: expect(received).toBe(expected) // Object.is equality
+
+Expected: 90
+Received: 100
+    at Object.&lt;anonymous&gt; (src/cart.test.ts:27:24)</failure>
+    </testcase>
+    <testcase classname="cart removes an item" name="cart removes an item" time="0.002" file="src/cart.test.ts">
+    </testcase>
+  </testsuite>
+</testsuites>

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites name="pytest tests">
+  <testsuite name="pytest" errors="1" failures="1" skipped="1" tests="5" time="0.412" timestamp="2026-10-20T21:10:03.123456-07:00" hostname="runner-1">
+    <testcase classname="tests.test_auth" name="test_login_ok" time="0.010" />
+    <testcase classname="tests.test_auth" name="test_login_expired_token" time="0.120">
+      <failure message="AssertionError: assert 401 == 200">def test_login_expired_token(client):
+        response = client.post("/auth/login", json=CREDS)
+&gt;       assert response.status_code == 200
+E       AssertionError: assert 401 == 200
+
+tests/test_auth.py:42: AssertionError</failure>
+    </testcase>
+    <testcase classname="tests.test_cards" name="test_import_variant[base1-4]" time="0.050">
+      <error message="failed on setup with &quot;psycopg.OperationalError: connection refused&quot;">psycopg.OperationalError: connection to server at "localhost" (127.0.0.1), port 5432 failed: Connection refused</error>
+    </testcase>
+    <testcase classname="tests.test_cards" name="test_import_variant[swsh1-25]" time="0.048" />
+    <testcase classname="tests.test_sync" name="test_slow_sync" time="0.000">
+      <skipped type="pytest.skip" message="requires network">tests/test_sync.py:10: requires network</skipped>
+    </testcase>
+  </testsuite>
+</testsuites>
