@@ -437,11 +437,15 @@ commit aren't supported.
 
 ```python
 token = uuid4()
-claimed = WorkflowRun.objects.filter(
-    pk=run_pk, repo__active=True, repo__installation__suspended_at__isnull=True,
-).filter(
-    Q(status="pending") | Q(status="processing", claimed_at__lt=now() - LEASE)
-).update(status="processing", claim_token=token, claimed_at=now(), attempts=F("attempts") + 1)
+claimed = (
+    WorkflowRun.objects.filter(
+        pk=run_pk,
+        repo__active=True,
+        repo__installation__suspended_at__isnull=True,
+    )
+    .filter(Q(status="pending") | Q(status="processing", claimed_at__lt=now() - LEASE))
+    .update(status="processing", claim_token=token, claimed_at=now(), attempts=F("attempts") + 1)
+)
 if not claimed:
     return  # someone else has it, it's done, or the repo is gone
 ```
