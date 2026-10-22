@@ -1,129 +1,93 @@
 # Flaky Test Tracker — v1 Design
 
-*Working name. Author: Tenzin Jamyang. Status: in development, v1 target December 2026.*
+*Working name. Author: Tenzin Jamyang. Implementation spec for
+[RFC 0001](docs/rfcs/0001-flaky-tracker-v1.md) rev. 3.*
 
-> Decisions, alternatives, risks and the build plan are in
-> [RFC 0001](docs/rfcs/0001-flaky-tracker-v1.md). Where the two disagree, the RFC wins.
+> The RFC holds the decisions, rules, risks and plan. This document holds the
+> exact limits, API calls, schema and algorithms needed to build it. Where the
+> two disagree, the RFC wins, and this document gets fixed.
 
-A GitHub App that records every CI test result, figures out which tests are flaky,
-and comments on pull requests so developers know whether a failure is their fault.
+A GitHub App that records every CI test result, detects which tests are flaky,
+and comments on pull requests so developers know whether a failure is likely
+theirs.
 
 ---
 
 ## 1. Problem
 
-A **flaky test** passes and fails on the same code with no change. Flaky tests:
-
-- make developers rerun CI over and over, wasting time and compute
-- teach teams to ignore red builds, so real failures slip through
-- are hard to spot by hand, because evidence is spread across hundreds of runs
-
-Large companies pay for tools that track this. Small teams, student projects and
-most open-source repos don't have one. GitHub Copilot can explain a single failed
-run, but nothing in the default GitHub experience tracks **a test's history
-across runs**, and history is what you need to know whether a failure is flaky.
+A **flaky test** passes and fails on the same code with no change. Flaky tests
+make developers rerun CI over and over, teach teams to ignore red builds, and are
+hard to spot by hand because the evidence is spread across hundreds of runs.
+Detecting them needs **history across runs**, which is what this App keeps.
 
 ## 2. What v1 does
 
-1. A maintainer installs the GitHub App on a repo and makes CI upload a JUnit XML
-   test report as an artifact (one extra step in their workflow; see §5.4).
-2. Every time a workflow run completes, the app downloads the report and stores
-   each test's result.
-3. The app detects flaky tests: tests that both passed and failed on **identical
-   code** (see §7).
-4. On a pull request with failing tests, the app posts (and keeps updating) one
-   comment that classifies each failure:
+1. A maintainer installs the App and adds one artifact-upload step to CI (§5.4).
+2. Every completed workflow run's JUnit reports are downloaded and stored.
+3. Tests that pass and fail on **identical code** get flake events (§7).
+4. Each PR gets one comment, with one section per workflow, that classifies
+   every failure:
 
 ```markdown
-### 🧪 Test report for `a1b2c3d` — 3 failures in `CI / test`
+<!-- flaky-tracker:v1 -->
+### 🧪 `CI` · commit `a1b2c3d` — 4 of 214 tests failed
 
 | Test | Verdict | Evidence |
 | --- | --- | --- |
-| `tests/test_auth.py::test_login_expired_token` | ⚠️ Known flaky | Passed and failed on identical code 4× in 30 days. Fails 8% of runs on `main`. |
-| `tests/test_api.py::test_rate_limit` | 🔴 Also failing on `main` | Failing on `main` since `9f8e7d6`. Probably not your change. |
-| `tests/test_cards.py::test_import_variant` | 🆕 New failure | Has never failed on `main`. Likely caused by this PR. |
+| `tests/test_auth.py::test_login_expired_token` | ⚠️ Has flaky history | Flipped on identical code 4× in 30 days ([latest](…)). Can still be a real failure. |
+| `tests/test_api.py::test_rate_limit` | 🔴 Also failing on `main` | Latest `main` result failed ([`9f8e7d6`](…)) |
+| `tests/test_cards.py::test_import_variant` | 🆕 New failure | Passed in the latest `main` run ([`4c1d2e0`](…)) |
+| `tests/test_sync.py::test_backfill` | ❔ Not enough history | No `main` result in the last 30 days |
 
-<details><summary>🤖 Possible cause of <code>test_import_variant</code> (AI-generated, may be wrong)</summary>
-
-The assertion expects 2 variants but got 3. This PR changed `catalog_import.py`,
-which now creates a variant for `reverse_holofoil`. Check whether the test's
-fixture data needs updating.
-</details>
+### ✅ `Lint` · commit `a1b2c3d` — all 12 reported tests passed
 ```
 
-5. A small read-only dashboard lists each repo's flakiest tests (public repos
-   only in v1).
+5. *After the core beta:* new failures on public repos get an AI explanation
+   added to the comment (§8).
 
 ## 3. Scope
 
-**In v1**
+**In v1:** GitHub Actions; any runner that emits JUnit XML (pytest, Jest via
+`jest-junit`, Gradle/Maven, Go via `go-junit-report`); flake detection; PR
+comments; deployment on AWS; AI enrichment for public repos after the core beta.
 
-- GitHub Actions only, triggered by the `workflow_run` webhook
-- Any test runner that can output JUnit XML (pytest, Jest via `jest-junit`,
-  JUnit/Gradle, Go via `go-junit-report`, …)
-- Flaky detection, PR verdict comments, AI explanation for new failures
-- Read-only dashboard for public repos
-- Deployed on AWS, installed on real repos
-
-**Not in v1** (see §14 for stretch goals)
-
-- Other CI providers (CircleCI, GitLab, Jenkins)
-- Automatic quarantine or retry of flaky tests
-- Comments on PRs from forks (they're recorded, but not commented on; see §5.5)
-- Slack/email notifications, billing, org-level analytics
-- Dashboard for private repos (needs GitHub OAuth login)
+**Not in v1:** other CI providers; quarantine or auto-retry; **fork-triggered
+runs** (ignored entirely); AI for private repos; the dashboard; notifications
+outside GitHub.
 
 ---
 
 ## 4. Architecture
 
 ```
-                    workflow_run (completed)
-  GitHub  ─────────────────────────────────────►  web (Django + gunicorn)
-    ▲                                              │ 1. verify signature
-    │                                              │ 2. INSERT delivery + run (status=pending),
-    │                                              │    one transaction; duplicate delivery → 200
-    │                                              │ 3. on commit: enqueue Celery task
-    │                                              │ 4. return 202 fast
-    │                                              ▼
-    │                                   Redis (broker) ──► worker (Celery)
-    │                                                        │ store results, flake events
-    │  list/download artifacts,                              ▼
-    │  get PR changed files,                            PostgreSQL ◄── dashboard (Django
-    │  create/update PR comment                              ▲          templates, read-only)
-    └──────────────────────────────────────────────── worker ┘───► LLM API (new failures only)
-
-  beat (Celery) ── every 5 min ──► re-enqueue runs stuck in "pending"
+GitHub ──webhooks──► web (Django + gunicorn)
+                       │ 1. verify signature   2. record delivery + run (1 txn)
+                       │ 3. on_commit → enqueue   4. return 202
+                       ▼
+                     Redis ──► worker (Celery) ──► GitHub REST API
+                                   │        └────► LLM API (post-beta, public repos)
+                                   ▼
+                              PostgreSQL ◄── admin (/admin/)
+                                   ▲
+       beat (Celery) ──────────────┘  sweep (5 min) · webhook recovery (10 min)
 ```
 
-**One Docker image, three processes:** `web` (gunicorn serving Django),
-`worker` (`celery -A config worker`) and `beat` (`celery -A config beat`, the
-scheduler for the periodic sweep). They share the code, Postgres and Redis.
+**One image, three processes:** `web` (`gunicorn config.wsgi`), `worker`
+(`celery -A config worker`) and `beat` (`celery -A config beat`).
 
-**Why the webhook handler does almost nothing:** GitHub expects a response within
-about 10 seconds and treats slow responses as failed deliveries. Downloading
-artifacts and calling an LLM can take much longer. The handler records the event
-and returns; the worker does the slow work.
+**Why the handler does almost nothing:** GitHub expects a response within ~10 s.
+Downloading artifacts takes longer, so the handler records the event and
+returns; the worker does the slow work.
 
-**Why Celery + Redis:** it's the standard background-job stack for Django, with
-retries, backoff, time limits and scheduling built in. The catch is that the
-database and the queue are separate systems, so "saved to Postgres" and "queued
-in Redis" can't happen atomically. Two patterns close that gap:
+**Closing the Postgres–Redis gap (a lightweight transactional outbox):**
 
-1. **`transaction.on_commit`:** the task is enqueued only after the transaction
-   that saved the run commits, so a worker never picks up a run that doesn't
-   exist yet.
-2. **The run row is the source of truth.** If the process dies or Redis is down
-   between commit and enqueue, the run stays `pending`. A periodic **sweep**
-   (Celery beat) re-enqueues runs that have been `pending` too long. Because
-   processing is idempotent, an occasional double-enqueue is harmless.
-
-Together these are a lightweight version of the *transactional outbox* pattern.
-
-**Stack:** Python 3.13, Django (ORM, migrations, admin), Celery + Redis,
-PostgreSQL, gunicorn, httpx, PyJWT with `cryptography` (for RS256),
-`defusedxml`, pytest + pytest-django + respx, uv, Ruff, mypy (with
-django-stubs), an LLM provider SDK. Infrastructure on AWS via Terraform (§11).
+1. The task is enqueued with `transaction.on_commit`, only after the run row is
+   committed.
+2. The **run row is the source of truth.** If enqueueing never happens (a crash,
+   or Redis is down), the run stays `pending`, and the beat sweep re-enqueues it.
+   Processing is idempotent, so a duplicate message is harmless.
+3. Webhooks that never reached us at all are recovered by the delivery-recovery
+   task (§5.7).
 
 ---
 
@@ -131,384 +95,457 @@ django-stubs), an LLM provider SDK. Infrastructure on AWS via Terraform (§11).
 
 ### 5.1 App registration
 
-- **Permissions** (least privilege):
-  - Actions: **Read** (list and download artifacts)
-  - Pull requests: **Read & write** (changed files, PR comments)
-  - Metadata: **Read** (required by GitHub)
-- **Subscribed events:** `Workflow run`. Apps receive `installation` and
+- **Permissions:** Actions **read**, Pull requests **read & write** (this also
+  allows comments on PRs through the issues API), Metadata **read**.
+- **Events:** `Workflow run`. Apps receive `installation` and
   `installation_repositories` events automatically.
-- **Secrets:** a webhook secret and the App's private key (`.pem`). Never commit
-  either; load them from environment variables or a secrets manager.
+- **Secrets:** webhook secret and private key (`.pem`), never committed.
 
 ### 5.2 Receiving webhooks
 
-1. Read the **raw request body** (before JSON parsing).
-2. Compute HMAC-SHA256 of the body with the webhook secret and compare it to the
-   `X-Hub-Signature-256` header using a **constant-time comparison**
-   (`hmac.compare_digest`). Reject with 401 if they don't match.
-3. Read `X-GitHub-Delivery` (a unique ID per delivery). If it's already in
-   `webhook_deliveries`, return 200 and do nothing: GitHub can deliver the same
-   event more than once, and redeliveries reuse the ID.
-4. Only enqueue `workflow_run` events where `action == "completed"` and
-   `conclusion` is `success` or `failure`. Passing runs matter too, because
-   they're half of the history. Handle `installation` events by
-   creating/deactivating installations and repos (and delete data on uninstall).
+1. Reject bodies over **5 MB**. Read the **raw body** before parsing JSON.
+2. HMAC-SHA256 over the raw body with the webhook secret; compare it to
+   `X-Hub-Signature-256` with `hmac.compare_digest`. Mismatch → 401.
+3. Route by `X-GitHub-Event`:
+   - `workflow_run` with `action == "completed"`: continue.
+   - `installation`, `installation_repositories`: lifecycle handling (§5.8).
+   - Anything else: 204.
+4. **Fork check:** `workflow_run.head_repository.id != repository.id` means a
+   fork run. Record the delivery, create no run, return 202.
+5. In one transaction: insert `Delivery(guid=X-GitHub-Delivery)` (a unique
+   violation means a duplicate, so return 200) and upsert
+   `WorkflowRun(run_id, run_attempt)` with `status=pending`.
+6. `transaction.on_commit(lambda: process_run.delay(run.pk))`, then return 202.
 
-**Local development:** forward webhooks to your laptop with a tunnel (smee.io is
-what GitHub's docs use). The App settings page has a *Recent Deliveries* tab where
-you can **redeliver** any past webhook, which is very useful for testing.
+All conclusions are accepted (`success`, `failure`, `cancelled`, `timed_out`,
+…). The run's artifacts decide whether there's anything to ingest.
+
+**Local development:** forward webhooks with smee.io. The App settings page lists
+recent deliveries and can **redeliver** any of them.
 
 ### 5.3 Authenticating as the App
 
-Two-step auth:
+1. **App JWT:** RS256, `iat` = now − 60 s, `exp` ≤ now + 10 min, `iss` = client
+   ID, signed with the private key. Used only for `/app/...` endpoints
+   (installation tokens, webhook deliveries).
+2. **Installation token:**
+   `POST /app/installations/{installation_id}/access_tokens` → token valid about
+   1 h. Cache it in Redis per installation until 5 min before expiry. Delete the
+   cache entry on suspend or uninstall.
 
-1. **App JWT:** sign a short-lived JWT (RS256, `iat` a little in the past, `exp`
-   ≤ 10 minutes ahead, `iss` = the App's client ID) with the private key. This
-   proves "I am the App" but can't access any repo.
-2. **Installation token:** call
-   `POST /app/installations/{installation_id}/access_tokens` with the JWT. You get
-   a token scoped to that installation's repos and permissions, valid for about an
-   hour. Cache it in memory until shortly before expiry.
+### 5.4 Test reports
 
-### 5.4 Getting test results
-
-The user's workflow must upload a JUnit report as an artifact whose name starts
-with `test-results`. Example for pytest:
+**Naming convention:** `test-results-<suite>-<attempt>`, where `<attempt>` is
+`${{ github.run_attempt }}` and `<suite>` names the job plus every matrix value.
 
 ```yaml
 - run: pytest --junitxml=reports/junit.xml
 - uses: actions/upload-artifact@v7
-  if: always()          # upload even when tests fail
+  if: always()
   with:
-    name: test-results
+    name: test-results-unit-${{ matrix.os }}-py${{ matrix.python }}-${{ github.run_attempt }}
     path: reports/
 ```
 
-Matrix jobs need one artifact per leg, e.g. `test-results-${{ matrix.python }}`.
-The artifact name becomes the test's **suite**, so each leg is tracked separately.
+**Name parsing:**
 
-The worker:
+| Artifact name | Suite | Attempt | Accepted? |
+| --- | --- | --- | --- |
+| `test-results-unit-3` | `unit` | 3 | if this run attempt is 3 |
+| `test-results-unit-ubuntu-py3.13-1` | `unit-ubuntu-py3.13` | 1 | if this run attempt is 1 |
+| `test-results-2` | `default` | 2 | if this run attempt is 2 |
+| `test-results-unit` (no numeric suffix) | `unit` | unknown | only when this run attempt is 1 |
+| `coverage-report` | n/a | n/a | ignored |
 
-1. `GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts` → find artifacts
-   named `test-results*` and skip any whose ID is already in the `artifacts`
-   table (re-runs can keep earlier attempts' artifacts).
-2. Download each artifact's zip. The API answers with a **redirect** to a
-   short-lived URL. httpx doesn't follow redirects by default.
-3. Unzip **in memory with limits**: max 50 MB compressed, 200 MB uncompressed, 50
-   files, only `*.xml`. (Why: protect against zip bombs from untrusted repos.)
-4. Parse with `defusedxml`, not the standard library parser. (Why: XML from
-   untrusted sources can trigger entity-expansion and XXE attacks.)
+The rule: strip the `test-results` prefix; if the last `-`-separated segment is
+all digits, it's the attempt; the rest (or `default`) is the suite.
 
-**JUnit XML in one paragraph:** `<testsuite>` elements contain `<testcase
-classname="…" name="…" time="…">`. A testcase with a `<failure>` or `<error>`
-child failed; with `<skipped>` it was skipped; otherwise it passed. Test runners
-differ in small ways (nested suites, `file` attributes), so the parser should be
-lenient and well tested with fixtures from several runners.
+**Discovery:** `GET /repos/{o}/{r}/actions/runs/{run_id}/artifacts?per_page=100`,
+following `Link` headers through every page. Filter by prefix in Python (the
+`name` query parameter is exact-match). Skip `expired` artifacts and those
+already in the `Artifact` table with `status=complete`.
 
-### 5.5 Finding the PR and commenting
+**Limits (per run unless noted):**
 
-- `workflow_run.pull_requests` lists PRs for the run's branch. It's **empty for
-  PRs from forks**, so v1 records those results but doesn't comment. (Stretch:
-  look up PRs by commit SHA.)
-- Keep **one comment per PR**. The first time, create it with
-  `POST /repos/{owner}/{repo}/issues/{pr_number}/comments` and store its ID. After
-  that, edit it with `PATCH …/issues/comments/{comment_id}`. Include a hidden
-  marker (`<!-- flaky-tracker -->`) so the comment can be found again if the
-  stored ID is lost.
-- If a later run passes, update the comment to "✅ All tests passing on
-  `<sha>`" rather than deleting it.
-- Changed files for the AI prompt: `GET /repos/{owner}/{repo}/pulls/{n}/files`
-  (file names only in v1).
+| Limit | Value | On breach |
+| --- | --- | --- |
+| Artifacts considered | 20 | extra ones rejected (`too_many_artifacts`) |
+| Compressed size per artifact | 50 MB (checked from `size_in_bytes` and while streaming) | artifact rejected |
+| Total downloaded | 100 MB | remaining artifacts rejected |
+| XML files per run | 500; non-`.xml` entries ignored | extra files skipped |
+| Decompressed size per XML file | 25 MB | file rejected |
+| Total decompressed | 200 MB | remaining files rejected |
+| Test cases | 50,000 | parsing stops; artifact `partial` |
+| Element nesting depth | 64 | file rejected |
+| Name / classname / file length | 1,024 chars | truncated for display; identity uses a hash of the full value |
+| Failure text stored | 4 KB after redaction | truncated |
+| Processing time | Celery soft limit 240 s, hard limit 300 s | run `partial` or retried |
+
+**Download and unzip:** the artifact endpoint returns a **302 redirect** to a
+short-lived URL; httpx needs `follow_redirects=True`. Stream to a
+`tempfile.SpooledTemporaryFile` while counting bytes. Read each zip entry through
+`ZipFile.open()` in chunks, counting decompressed bytes. Never trust the size
+the zip header claims.
+
+**Parsing:** `defusedxml.ElementTree.iterparse` with `start`/`end` events;
+track depth; on each `</testcase>`, extract and then `elem.clear()` to keep
+memory flat. Outcome: a `<failure>` or `<error>` child → failed; `<skipped>` →
+skipped; otherwise passed. Handle both `<testsuites>` and bare `<testsuite>`
+roots and nested suites. Fixtures are in `tests/fixtures/junit/`.
+
+**Aggregation:** the same test key appearing several times in one attempt
+(runner-level retries) is stored as **counts** (`passed_count`, `failed_count`,
+`skipped_count`) on one `TestResult`. A test with both passes and failures in one
+attempt is itself a flake signal (§7).
+
+**Atomicity:** each artifact's `TestResult` rows **and** its `status=complete`
+are written in one transaction, so a crash can't leave half an artifact
+ingested.
+
+### 5.5 PR comments
+
+- Only for runs with `event == "pull_request"` from the same repository, linked
+  through `workflow_run.pull_requests[]`.
+- **Current head check:** `GET /repos/{o}/{r}/pulls/{n}`. If `head.sha` differs
+  from the run's `head_sha`, store the results but don't touch the comment.
+- **Section ordering:** each section (per workflow) records `head_sha`,
+  `run_id`, `run_attempt` and `run_started_at`. Replace it only if the incoming
+  run is for the current head **and** (the section shows an older head, **or**
+  the incoming `(run_started_at, run_attempt)` is newer).
+- **Concurrency:** hold a Postgres advisory lock on `(repo, pr)` while reading
+  sections, rendering and PATCHing, so two workers can't overwrite each other.
+- **Create vs update:**
+  1. If `PrComment.comment_id` is stored → `PATCH /repos/{o}/{r}/issues/comments/{id}`.
+     On 404 (deleted), forget it and continue.
+  2. Otherwise, list the PR's comments (all pages) and look for one whose
+     author is the App's bot user and whose body contains the marker. If found,
+     store its ID and PATCH.
+  3. Otherwise `POST /repos/{o}/{r}/issues/{n}/comments` and store the ID in
+     the same transaction that records the section.
+- **States per section:** failures table; "✅ all N reported tests passed";
+  "⚠️ no test report found (setup link)"; "⚠️ report partially processed:
+  <reason>".
+- **Escaping:** report text and model output go inside code spans or blocks
+  with backticks escaped; `@` becomes `@​` so nobody gets pinged; no raw
+  HTML or auto-linked URLs from report content.
+
+### 5.6 API client behavior
+
+- **Pagination:** always `per_page=100`; follow `Link: rel="next"` until it's
+  gone.
+- **Primary limit:** if `x-ratelimit-remaining == 0`, wait until
+  `x-ratelimit-reset`.
+- **Secondary limit:** 403/429 with `retry-after` → wait that long; with no
+  header → wait ≥ 60 s, doubling on each retry.
+- **Shared backoff:** store "backoff until" per installation in Redis; every
+  task checks it before calling, so concurrent tasks don't pile on.
+- **Permission errors:** 401, or 403 with no rate-limit signal → no retry; mark
+  the run `failed` with `last_error`, visible in the admin.
+- **Transient errors:** network errors and 5xx → Celery retry with exponential
+  backoff and jitter, at most 5 times.
+
+### 5.7 Webhook delivery recovery
+
+GitHub **doesn't automatically retry** failed deliveries, and only allows
+redelivering deliveries from the **past 3 days**.
+
+Every 10 minutes (beat → `recover_failed_deliveries`):
+
+1. Using the **App JWT**, page through `GET /app/hook/deliveries?per_page=100`
+   (cursor pagination), from newest to oldest, until reaching the stored
+   high-water mark or deliveries older than 3 days.
+2. Group by `guid`. A GUID needs recovery if none of its attempts succeeded
+   (2xx/3xx), **and** it isn't in our `Delivery` table, **and** we've
+   redelivered it fewer than 3 times.
+3. `POST /app/hook/deliveries/{id}/attempts` for each; record the attempt in
+   `DeliveryRedelivery`.
+4. Advance the high-water mark (newest delivery ID seen) in
+   `DeliveryRecoveryState`.
+5. Alert (CloudWatch metric + log) when any GUID exhausts its 3 attempts or the
+   oldest unrecovered failure is more than 2 days old.
+
+A redelivery arrives with the same GUID, so §5.2 step 5 dedupes it if the
+original was in fact recorded.
+
+### 5.8 Installation lifecycle
+
+| Event | Action |
+| --- | --- |
+| `installation.created` | create the installation; sync its repositories |
+| `installation.deleted` | delete the installation (cascades to all data); drop its cached token |
+| `installation.suspend` / `unsuspend` | set or clear `suspended_at`; drop its cached token |
+| `installation.new_permissions_accepted` | sync repositories |
+| `installation_repositories.added` / `removed` | **sync repositories** (don't trust the diff; it can be empty when the selection mode changes) |
+
+**Sync:** page through `GET /installation/repositories` with the installation
+token. Upsert the repos returned; repos no longer returned are marked inactive
+and their data deleted. A `process_run` for an inactive repo or a suspended
+installation exits at the claim step without writing anything.
 
 ---
 
 ## 6. Data model
 
-A starting point. These become Django models; the source of truth is the
-migrations Django generates from them. The admin is registered for each model,
-so data can be inspected at `/admin/` while debugging.
+Django models; migrations are generated from them. Every model is registered in
+the admin. `→` means a foreign key (`on_delete=CASCADE` unless noted).
 
 ```
-installations
-  id (GitHub installation id, PK), account_login, active, created_at
+Installation
+  id (GitHub installation id, PK), account_login, suspended_at (null), created_at
 
-repositories
-  id (GitHub repo id, PK), installation_id → installations, full_name,
-  default_branch, is_private, active, created_at
+Repository
+  id (GitHub repo id, PK), installation →, full_name, default_branch,
+  is_private, active, created_at
 
-webhook_deliveries
-  delivery_id (PK, from X-GitHub-Delivery), event, received_at
+Delivery
+  guid (PK), event, action, installation_id (null), received_at
 
-workflow_runs
-  (run_id, run_attempt) PK, repo_id → repositories, workflow_name,
-  head_sha, head_branch, event, conclusion, pr_number (nullable),
-  status (pending|processing|processed|no_artifacts|failed), attempts,
-  last_error, created_at, processed_at
-  INDEX (status, created_at)            -- for the stuck-run sweep
+DeliveryRecoveryState            -- single row
+  high_water_delivery_id, updated_at
 
-artifacts
-  id (GitHub artifact id, PK), run_id, run_attempt (first seen), name,
-  size_bytes, processed_at              -- makes ingestion idempotent
+DeliveryRedelivery
+  guid, delivery_id, attempted_at, attempt_number
+  UNIQUE (guid, attempt_number)
 
-tests
-  id (PK), repo_id, suite, test_key, file, classname, name, first_seen_at
-  UNIQUE (repo_id, suite, test_key)     -- suite = artifact name
-                                        -- test_key = "file::classname::name"
+WorkflowRun
+  id (PK), repo →, run_id, run_attempt, workflow_id, workflow_path,
+  event, head_sha, head_branch, pr_number (null), run_started_at, conclusion,
+  status (pending|processing|processed|partial|no_reports|failed),
+  claim_token (null), claimed_at (null), attempts, last_error, created_at
+  UNIQUE (run_id, run_attempt)
+  INDEX (status, created_at)                     -- sweep
 
-test_results
-  id (PK), test_id → tests, run_id, run_attempt, head_sha, branch, event,
-  outcome (passed|failed|skipped), duration_ms, failure_message (≤ 4 KB),
-  created_at
-  UNIQUE (test_id, run_id, run_attempt)
-  INDEX (test_id, created_at DESC)
-  INDEX (test_id, head_sha)
+Artifact
+  id (GitHub artifact id, PK), run →, name, suite, attempt (null),
+  size_bytes, status (complete|rejected|partial), reject_reason, processed_at
 
-flake_events
-  id (PK), test_id → tests, group_key, detected_at
-  UNIQUE (test_id, group_key)           -- group_key = "run:<run_id>" or "sha:<head_sha>"
+Test
+  id (PK), repo →, workflow_id, suite, key_hash (sha256 of test_key),
+  test_key (display, truncated), file, classname, name, first_seen_at
+  UNIQUE (repo, workflow_id, suite, key_hash)
 
-pr_comments
-  (repo_id, pr_number) PK, comment_id, last_head_sha, updated_at
+TestResult
+  id (PK), test →, run →, artifact →, outcome (passed|failed|skipped),
+  passed_count, failed_count, skipped_count, duration_ms,
+  failure_text (≤ 4 KB, redacted), occurred_at (= run.run_started_at),
+  is_default_branch, group_key
+  UNIQUE (test, run)
+  INDEX (test, is_default_branch, occurred_at DESC)   -- latest main result
+  INDEX (test, group_key)                             -- flake detection
 
-ai_explanations
-  signature (PK, hash), explanation, model, input_tokens, output_tokens,
-  created_at
+FlakeEvent
+  id (PK), test →, group_key, occurred_at
+  UNIQUE (test, group_key)
+  INDEX (test, occurred_at DESC)
+
+PrComment
+  id (PK), repo →, pr_number, comment_id (null), updated_at
+  UNIQUE (repo, pr_number)
+
+PrCommentSection
+  id (PK), comment →, workflow_id, head_sha, run →, run_started_at,
+  run_attempt, body_markdown
+  UNIQUE (comment, workflow_id)
+
+AiExplanation                     -- post-beta
+  id (PK), repo →, signature, prompt_version, model, text,
+  input_tokens, output_tokens, created_at, expires_at
+  UNIQUE (repo, signature, prompt_version, model)
 ```
 
-Open questions for the schema:
+**Outcome rule:** `outcome = failed` if `failed_count > 0`, else `passed` if
+`passed_count > 0`, else `skipped`.
 
-- `test_results` will be by far the biggest table. What indexes do the detection
-  queries actually need? Check with `EXPLAIN ANALYZE`.
-- Why is `(run_id, run_attempt)` the key, not just `run_id`? (Reruns of the same
-  run are the best flakiness signal.)
-- Retention: drop `test_results` older than 90 days? What does that do to the
-  stats?
+**Retention:** a nightly beat task deletes `TestResult` rows with `occurred_at`
+older than 90 days, plus expired `AiExplanation` rows. Every statistic shown to
+users states its window and sample count.
 
 ---
 
 ## 7. Flaky detection
 
-Keep the rules simple enough to explain in one sentence.
+**Group key** (computed at ingest and stored on `TestResult`):
 
-**Outcome normalization:** `failure` and `error` → `failed`; `skipped` is ignored
-for detection.
+| `event` | `group_key` |
+| --- | --- |
+| `push`, `schedule` | `sha:<workflow_id>:<head_sha>` |
+| everything else (`pull_request`, `pull_request_target`, `merge_group`, `workflow_dispatch`, …) | `run:<run_id>` |
 
-**Flake event (the core signal):** a test has a flake event when it has both a
-`passed` and a `failed` result **on identical code**. Two groups count as
-identical code:
+**Recording flake events:** after an artifact is stored, under
+`pg_advisory_xact_lock(hash(repo_id))`, for each test touched:
 
-- **Attempts of the same run** (`run:<run_id>`): a re-run reuses the original
-  commit and ref.
-- **`push`, `workflow_dispatch` or `schedule` runs with the same `head_sha`**
-  (`sha:<head_sha>`).
+```sql
+-- does this test now have both outcomes within this group?
+SELECT SUM(passed_count) > 0 AND SUM(failed_count) > 0, MAX(occurred_at)
+FROM test_result
+WHERE test_id = %s AND group_key = %s;
+-- if yes: INSERT INTO flake_event (test_id, group_key, occurred_at) ... ON CONFLICT DO NOTHING
+```
 
-Separate `pull_request` runs with the same `head_sha` do **not** count. A PR run
-tests a temporary merge of the PR into its base branch, which changes whenever
-the base branch moves, so the code may differ. Record one event per (test,
-group) in `flake_events`.
+The lock matters: without it, two workers storing the passing and the failing
+result for the same group at the same moment could each see only their own row,
+and both would miss the flake.
 
-**Known flaky:** at least `FLAKY_MIN_EVENTS` (default 1) flake events in the last
-`FLAKY_WINDOW_DAYS` (default 30).
+**Verdicts** (failed tests in a PR run on the current head), in order:
 
-**Verdict for each failed test on a PR run** (checked in this order):
+1. **Has flaky history:** `count(FlakeEvent where occurred_at ≥ now − FLAKY_WINDOW_DAYS) ≥ FLAKY_MIN_EVENTS`.
+2. **Not enough history:** no `TestResult` with `is_default_branch` and
+   `outcome != skipped` within the window.
+3. **Also failing on main:** the latest such result is `failed`.
+4. **New failure:** the latest such result is `passed`.
 
-1. ⚠️ **Known flaky:** the test meets the rule above.
-2. 🔴 **Also failing on main:** the test's most recent result on the default
-   branch is `failed`.
-3. 🆕 **New failure:** neither applies. This is probably caused by the PR, so it's
-   the only verdict that gets an AI explanation.
-
-**Displayed but not used for verdicts in v1:** failure rate on the default branch
-over the last 50 results. (Why not use it? Picking a threshold like "5% = flaky"
-is hard to justify without data. Collect the data first, then decide.)
-
-**Concurrency gotcha:** if two workers store results for the same commit at the
-same moment, each may see only its own results and both miss the flake. Fix:
-take a per-repo lock (`pg_advisory_xact_lock(repo_id)`) while inserting results
-and checking for flake events. Trade-off: this serializes ingestion per repo, which
-is fine at v1 scale.
-
-**Known limitations (state them in the README):** renamed tests start with no
-history; parametrized tests are tracked per parameter set; a test that only ever
-runs on PRs has no `main` history.
+**Known limitations (README):** renamed tests start with no history;
+parametrized tests are tracked per parameter set; PR-only suites always show "not
+enough history"; workflows that check out a different ref than the triggering
+commit aren't supported.
 
 ---
 
-## 8. AI explanations
+## 8. AI explanations (after the core beta)
 
-Only for 🆕 new failures, and the comment must work fine without them.
-
-- **Input:** test key, failure message and traceback (first 30 + last 30 lines,
-  capped around 6,000 characters), and the PR's changed file names.
-- **Output:** at most 3 sentences: likely cause, where to look, and a plain
-  "unsure" when the evidence is thin. Always labelled *AI-generated, may be
-  wrong*.
-- **Guardrails:**
-  - Max 3 explanations per run and 50 per installation per day
-  - 20-second timeout. On any error, post the comment without the explanation.
-  - **Redact before sending:** patterns that look like tokens or keys (`ghp_…`,
-    `AKIA…`, `Bearer …`, long hex strings). CI logs leak secrets more often than
-    you'd think.
-  - **Cache** by signature = hash of (test key + normalized first error line,
-    with numbers, hex and memory addresses stripped). The same failure seen again
-    reuses the explanation.
-  - Log input/output tokens per call so you can report the cost.
-- **Model:** a small, cheap model is enough. Use a config variable so it can
-  change.
-- **Evaluate it:** keep 10–15 real failures from the playground repo with the
-  cause you know, and check the explanations against them when you change the
-  prompt.
+- **When:** only 🆕 new failures, only public repositories. Runs as a separate
+  task (`explain_failures`) **after** the comment is posted. It edits the
+  comment only if the PR head hasn't changed.
+- **Input:** test key and redacted failure text (first 30 + last 30 lines,
+  ≤ 6,000 chars), plus the PR's changed file names
+  (`GET /repos/{o}/{r}/pulls/{n}/files`).
+- **Output:** ≤ 3 sentences (likely cause, where to look, or "unsure"). It's
+  rendered as untrusted text (§5.5) under *AI-generated, may be wrong*.
+- **Limits:** 3 per run, 50 per installation per day, 20 s timeout. Failures
+  are silent; the comment is already posted.
+- **Cache:** per repository. `signature` = sha256 of (test key + normalized
+  first error line, with numbers, hex and addresses stripped). The key includes
+  `prompt_version` and `model`; entries expire after 30 days and cascade-delete
+  with the repo.
+- **Evaluation:** 10–15 real failures with known causes from the playground;
+  re-run them whenever the prompt changes.
 
 ---
 
 ## 9. Background jobs (Celery)
 
-**Tasks**
-
-| Task | Triggered by | Does |
+| Task | Trigger | Does |
 | --- | --- | --- |
-| `process_workflow_run(run_id)` | webhook (on commit), sweep | download → parse → store → detect → comment |
-| `sweep_pending_runs()` | beat, every 5 min | re-enqueue runs `pending` for more than 5 min |
-| `handle_installation_event(payload)` | webhook (on commit) | create/deactivate installations and repos; delete data on uninstall |
+| `process_run(run_pk)` | webhook (`on_commit`), sweep | claim → discover → ingest → detect → comment → finish |
+| `sweep_runs()` | beat, every 5 min | re-enqueue runs `pending` > 5 min or `processing` with `claimed_at` > 10 min ago |
+| `recover_failed_deliveries()` | beat, every 10 min | §5.7 |
+| `sync_installation(installation_id)` | lifecycle events | §5.8 |
+| `explain_failures(run_pk)` | after `process_run` (post-beta) | §8 |
+| `prune_old_data()` | beat, nightly | §6 retention |
 
-**Settings already in `config/settings.py`:** `CELERY_TASK_ACKS_LATE` (a task
-is redelivered if the worker dies mid-task), `CELERY_WORKER_PREFETCH_MULTIPLIER
-= 1` (one task at a time) and a 300 s hard time limit.
+**Claim (committed before any network call):**
 
-**Retries:** network errors and GitHub 5xx retry with exponential backoff and
-jitter (Celery's `autoretry_for` + `retry_backoff`), up to 5 times. After that
-the run is marked `failed` with `last_error` saved, and shows up in the admin.
+```python
+token = uuid4()
+claimed = WorkflowRun.objects.filter(
+    pk=run_pk, repo__active=True, repo__installation__suspended_at__isnull=True,
+).filter(
+    Q(status="pending") | Q(status="processing", claimed_at__lt=now() - LEASE)
+).update(status="processing", claim_token=token, claimed_at=now(), attempts=F("attempts") + 1)
+if not claimed:
+    return  # someone else has it, it's done, or the repo is gone
+```
 
-**Rate limits:** GitHub API responses include rate-limit headers. On a 403/429
-rate-limit response, retry with `countdown` set to the reset time instead of
-the normal backoff.
+Every later write filters on `claim_token=token`. If it updates 0 rows, the
+worker has lost its claim and stops.
 
-**Idempotency:** with late acks, retries and the sweep, a run can be processed
-more than once, and that must change nothing. Mechanisms: the run's `status`
-check at the start of the task, the `artifacts` table (each artifact ingested
-once), and unique constraints with upserts (`test_results (test_id, run_id,
-run_attempt)`, `flake_events (test_id, group_key)`).
+**Timing (all must hold):** soft time limit 240 s < hard time limit 300 s <
+lease 10 min < Redis `visibility_timeout` 1 h. A task is killed long before its
+lease expires, and the broker never redelivers a message while its task can
+still be running. Settings to add in M2: `CELERY_TASK_SOFT_TIME_LIMIT`,
+`CELERY_BROKER_TRANSPORT_OPTIONS = {"visibility_timeout": 3600}`.
 
-**Testing tasks:** call the task function directly in tests (no broker needed);
-Celery wiring is covered by one smoke test.
+**Already configured:** `CELERY_TASK_ACKS_LATE`,
+`CELERY_WORKER_PREFETCH_MULTIPLIER = 1`, `CELERY_TASK_TIME_LIMIT = 300`.
+
+**Idempotency:** the claim, `Artifact.status`, `UNIQUE (test, run)`, `UNIQUE
+(test, group_key)` on flake events, and the comment marker lookup.
+
+**Testing tasks:** call the task functions directly against the test database,
+with GitHub mocked by `respx`; one smoke test covers the Celery wiring.
 
 ---
 
 ## 10. Security and privacy
 
-- Verify every webhook signature; reject unsigned requests.
-- Least-privilege App permissions (§5.1). No access to source code contents.
-- Store only test names, outcomes, durations and truncated failure messages.
-- Treat all artifact contents as untrusted: size limits, `defusedxml`, no
-  executing anything.
-- Redact secrets before LLM calls (§8).
-- On `installation.deleted`, delete that installation's data.
-- Private-repo data never appears on the public dashboard.
-- Secrets live in env vars / AWS secrets store, never in the repo.
+- Signed webhooks only; 5 MB body cap; constant-time comparison.
+- Least-privilege permissions (§5.1); no repository contents.
+- All report content is untrusted: streaming, limits (§5.4), `defusedxml`,
+  depth cap, field caps, deadlines.
+- **What's stored** (stated in the README): test identifiers, outcomes,
+  durations, and the first 4 KB of failure output. That output can include
+  source snippets or anything a test printed. Token-like strings (`ghp_…`,
+  `github_pat_…`, `AKIA…`, `Bearer …`, `-----BEGIN … KEY-----`, long hex or
+  base64) are redacted **before** storage, logging, rendering and model calls.
+  This is best-effort.
+- AI only on public repositories; model output is escaped like report text.
+- Uninstalling or removing a repo deletes its data (cascade).
+- Secrets: AWS Secrets Manager in production, `.env` locally; OIDC for CI
+  deploys.
 
 ---
 
 ## 11. Deployment and operations
 
-All infrastructure is defined in **Terraform** (`infra/`), so it can be
-reviewed, recreated and torn down with one command.
+Infrastructure is defined in **Terraform** (`infra/`), deployed in M3.
 
 | Piece | AWS service |
 | --- | --- |
-| Container images | ECR |
-| `web`, `worker`, `beat` | ECS Fargate: three services, one image, different commands |
-| HTTPS endpoint for webhooks | Application Load Balancer + ACM certificate |
-| Database | RDS PostgreSQL (smallest instance; can share Cardfolio's instance with a separate database) |
-| Broker | ElastiCache Redis (or a Redis container if cost matters) |
-| Secrets | Secrets Manager, injected into tasks as environment variables |
-| Logs and alarms | CloudWatch Logs; alarms on task failures and stuck runs |
-| Errors | Sentry (free tier) for exceptions in web and worker |
+| Images | ECR |
+| `web`, `worker`, `beat` | ECS Fargate: three services, one image |
+| HTTPS for webhooks | ALB + ACM certificate |
+| Database | RDS PostgreSQL (smallest; may share Cardfolio's instance) |
+| Broker | ElastiCache Redis or a Redis container (open question) |
+| Secrets | Secrets Manager → task environment variables |
+| Logs, metrics, alarms | CloudWatch |
+| Errors | Sentry |
 
-- **CI/CD:** GitHub Actions runs lint, types, tests and a Docker build on every
-  PR. On merge to `main`, it builds and pushes the image to ECR, runs
-  migrations as a one-off ECS task, then updates the services. AWS access uses
-  GitHub's OIDC role, not long-lived keys.
-- **Logging:** structured JSON logs that include `delivery_id`, `run_id` and
-  the Celery task ID, so one webhook can be traced end to end.
-- **Health:** `/healthz` for the load balancer; Celery worker health via
-  `celery inspect ping`.
-- **Numbers to watch:** runs stuck in `pending`, task failure rate, time from
-  webhook to PR comment, runs processed, LLM cost per day.
-- **Cost control:** smallest Fargate sizes, one task per service, 90-day data
-  retention, and `terraform destroy` for anything not in use.
+- **CI/CD:** every PR runs lint, types, tests and a Docker build. A merge to
+  `main` pushes the image to ECR, runs `migrate` as a one-off ECS task, then
+  updates the services. AWS access uses OIDC.
+- **Logs:** JSON lines carrying `delivery_guid`, `run_id`, `run_attempt` and
+  the task ID.
+- **Alarms:** runs stuck `pending` > 15 min; task failure rate; webhook recovery
+  exhausted or lagging; 5xx on `/webhooks/github`.
+- **Metrics:** processing time (receipt → comment) and GitHub delivery delay
+  (`run.updated_at` → receipt), reported separately.
+- **Cost:** smallest sizes, one task per service, retention, `terraform
+  destroy` when idle.
 
 ---
 
 ## 12. Testing strategy
 
-- **Unit:** signature verification (known good/bad bodies), JUnit parser
-  (fixtures from pytest, Jest and Go, plus malformed files, an XXE attempt and an
-  oversized zip), detection rules (table-driven: given these results → this
-  verdict), comment rendering, secret redaction.
-- **Integration:** tasks called directly against a real Postgres test database
-  (pytest-django creates it), with the GitHub API mocked using `respx`.
-- **End to end:** a separate public repo, `flaky-playground`, with a few tests
-  that fail at random (e.g. 30% of the time) and CI that uploads JUnit reports.
-  Open PRs there and watch real comments appear. It also gives you the demo GIF.
+- **Unit:** signature verification; artifact-name parsing table (§5.4); JUnit
+  parser with every fixture plus oversized and deeply nested files; group-key
+  table; verdict table; comment rendering and escaping; redaction.
+- **Integration:** tasks against a real Postgres test database, GitHub mocked
+  with `respx`, including pagination and rate-limit responses.
+- **Acceptance (M5):** deterministic flips; partial re-runs; reordered and
+  duplicate deliveries; worker crash mid-run; failed delivery → recovery; two
+  runs racing to update one comment; oversized artifact rejected.
+- **End to end:** the `flaky-playground` repo with randomly failing tests,
+  real PRs and real comments.
 
 ---
 
 ## 13. Roadmap
 
-**Week 0 — Setup (while finishing Cardfolio, ~2 evenings)**
-- Register the GitHub App (no code). Create `flaky-playground` with a
-  deliberately flaky test and the artifact upload step.
+Milestones, estimates and dates are in RFC 0001 §10. In short:
 
-**Week 1 — Webhook receiver**
-- Django webhook view, signature check, delivery dedupe, delivery + run insert in
-  one transaction with `on_commit` enqueue. Models v1 and migrations. Smee forwarding.
-- *Done when:* rerunning a workflow in the playground creates exactly one run
-  row and one task, and redelivering the same webhook creates neither.
-
-**Week 2 — Worker and ingestion**
-- Celery task with retries and backoff, stuck-run sweep, App JWT → installation
-  token, artifact download, safe unzip, JUnit parser, storing results with upserts.
-- *Done when:* real playground runs show up as rows in `test_results`, and
-  processing a run twice doesn't duplicate anything.
-
-**Week 3 — Detection and PR comments**
-- Flake events, verdict logic, comment rendering, sticky create/update.
-- *Done when:* a playground PR gets one comment with correct verdicts that
-  updates on each push.
-
-**Week 4 — AI explanations**
-- Prompt, redaction, caching, limits, timeout fallback, small evaluation set.
-- *Done when:* new failures get a useful explanation, and turning off the LLM
-  API key doesn't break comments.
-
-**Week 5 — Deploy and dashboard**
-- Terraform for ECR, ECS Fargate (web, worker, beat), RDS, Redis, ALB and
-  secrets; CI/CD deploy on merge; Sentry. Read-only dashboard with Django templates.
-- *Done when:* the App is installable by anyone from its public page and runs
-  without your laptop.
-
-**Week 6 — Real users and launch**
-- Install on Cardfolio and 3–5 classmates' repos; reach out to a few small
-  open-source projects with CI flakiness. README with setup steps, limitations
-  and a demo GIF. Post as a Show HN / on r/github.
-
----
+M0 setup & spikes → M1 webhook intake → M2 ingestion worker → M3 first deploy
+→ M4 detection & comments → M5 hardening, **core beta** → M6 AI enrichment &
+launch.
 
 ## 14. Stretch goals (after v1)
 
-- Comments on fork PRs (find the PR by commit SHA)
-- GitHub Check Run instead of / alongside the comment
-- Weekly "top 5 flakiest tests" issue or digest
-- Private-repo dashboard behind GitHub OAuth login
-- Try SQS as the Celery broker and write up the trade-offs vs Redis
-- Use failure-rate data to tune detection thresholds
-
----
+- Fork PRs with an isolated, untrusted history
+- GitHub Check Run alongside the comment
+- Read-only dashboard (Django templates; public repos first)
+- Weekly "flakiest tests" digest issue
+- SQS as the Celery broker, with a write-up of the trade-offs
+- Failure-rate thresholds tuned on collected data
 
 ## 15. Open decisions
 
-- Final name (check that it isn't already taken on GitHub Marketplace).
-- LLM provider and model.
-- Hosting: share Cardfolio's RDS instance, or run separately?
-- Broker on AWS: ElastiCache, or a Redis container to save cost?
-- Publish the dashboard for public repos in v1, or ship comments only?
+See RFC 0001 §11.
