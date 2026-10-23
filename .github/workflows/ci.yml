@@ -5,18 +5,25 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  DJANGO_SECRET_KEY: ci-only-not-secret
+  DJANGO_DEBUG: "true"
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: astral-sh/setup-uv@v7
         with:
-          python-version: "3.13"
-          cache: pip
-      - run: pip install -e ".[dev]"
-      - run: ruff check .
-      - run: ruff format --check .
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Ruff (lint)
+        run: uv run ruff check .
+      - name: Ruff (format)
+        run: uv run ruff format --check .
+      - name: Mypy (types)
+        run: uv run mypy .
 
   test:
     runs-on: ubuntu-latest
@@ -26,7 +33,7 @@ jobs:
         env:
           POSTGRES_USER: flaky
           POSTGRES_PASSWORD: flaky
-          POSTGRES_DB: flaky_tracker_test
+          POSTGRES_DB: flaky_tracker
         ports:
           - 5432:5432
         options: >-
@@ -35,17 +42,26 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      TEST_DATABASE_URL: postgresql+psycopg://flaky:flaky@localhost:5432/flaky_tracker_test
+      DATABASE_URL: postgres://flaky:flaky@localhost:5432/flaky_tracker
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: astral-sh/setup-uv@v7
         with:
-          python-version: "3.13"
-          cache: pip
-      - run: pip install -e ".[dev]"
-      - run: pytest --junitxml=reports/junit.xml
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Check for missing migrations
+        run: uv run python manage.py makemigrations --check --dry-run
+      - name: Tests
+        run: uv run pytest --junitxml=reports/junit.xml
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: test-results
           path: reports/
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build image
+        run: docker build -t flaky-tracker:ci .

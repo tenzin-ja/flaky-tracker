@@ -6,6 +6,8 @@ __pycache__/
 venv/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+staticfiles/
 .coverage
 htmlcov/
 dist/
