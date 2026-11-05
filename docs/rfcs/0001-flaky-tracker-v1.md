@@ -3,440 +3,622 @@
 | | |
 | --- | --- |
 | **Author** | Tenzin Jamyang |
-| **Status** | Draft, rev. 4 (addresses review round 1; see [§15](#15-review-responses)) |
+| **Status** | **Proposed draft, rev. 5 — pending review/approval** |
 | **Created** | 2026-10-20 |
-| **Target** | First deploy ~2026-12-20 · core beta with external users ~2027-01-10 · v1 launch ~2027-01-24 |
+| **Updated** | 2026-10-30 |
+| **Targets (provisional)** | Local end-to-end demonstration ~2026-12-20 · AWS deploy ~2027-01-10 · public core beta ~2027-01-24 |
 | **Related** | [`DESIGN.md`](../../DESIGN.md): implementation specs (API calls, limits, schema detail, comment format) |
 
-> **Reviewers:** this RFC covers *what* v1 is, the rules it follows, the key
-> decisions, the risks and the plan. `DESIGN.md` holds exact numbers and API
-> details. Where the two disagree, this RFC wins. Questions for reviewers are in
-> [§12](#12-questions-for-reviewers).
+> **Reviewers:** this RFC covers *what* v1 is, its boundaries, behavior,
+> architectural decisions, risks and plan. `DESIGN.md` contains exact schemas,
+> API details and numerical limits. **`DESIGN.md` still describes rev. 4 and
+> is reconciled with this revision during M0 (§10, §16), before any affected
+> module is implemented.** Where the two disagree, this RFC is the proposed
+> source of truth, **once approved**. M0 spike findings remain unverified
+> until experiments are completed.
 
 ---
 
 ## 1. Summary
 
-A GitHub App that ingests JUnit XML test reports from GitHub Actions runs,
-detects flaky tests by finding tests whose outcome changed **while the code under
-test did not**, and keeps one comment on each pull request that classifies every
-failure using the test's recorded history: *has flaky history*, *also failing on
-main*, *new failure* or *not enough history*. After the core ships, new failures
-on public repositories also get a short, clearly labelled AI-generated
-explanation.
+Flaky Test Tracker is a GitHub App that consumes JUnit XML reports uploaded as
+GitHub Actions artifacts, records test-result history, detects tests that have
+both passed and failed in a supported same-revision comparison group, and
+maintains **one sticky PR comment with one section per workflow**.
 
-Flaky detection is deterministic, based on stored results. AI is an optional
-enrichment and never decides a verdict.
+For the first beta, a failed test receives one of three conservative verdicts:
+**has flaky history**, **not enough history**, or **no flaky history observed**.
+The tool never labels a failure as *new* or *already failing on main*: comparing
+against the default branch is deferred. A flaky-history verdict is evidence of
+inconsistency, **not** proof that the current failure is harmless.
 
-v1 is a Django application with Celery workers (Redis as the broker) and
-PostgreSQL as the system of record. One Docker image runs as three processes
-(web, worker, scheduler) on AWS ECS Fargate, with infrastructure in Terraform.
+v1 uses **Django**, **PostgreSQL** (durable system of record), **Celery + Redis**
+(asynchronous execution), and **AWS ECS Fargate + Terraform** for an actual
+cloud deployment. Start with one web service and one single-concurrency worker;
+an EventBridge Scheduler schedule launches a short-lived ECS task that sweeps
+durable, recorded work. The design
+retains idempotent database effects and fault testing without claiming
+exactly-once task execution or production-scale availability.
+
+This is a backend/platform engineering portfolio project with a modest user
+adoption goal, **not a startup or full CI observability platform**. The core
+beta should be demonstrable and resume-ready before additional features.
 
 ## 2. Motivation
 
-Flaky tests pass and fail on identical code. They cost teams in three ways:
-reruns waste developer time and CI minutes; red builds stop meaning anything, so
-real regressions get merged; and the evidence is spread across hundreds of runs,
-so nobody can say which tests are flaky. At Google, almost 16% of tests showed
-some flakiness, and 84% of observed pass-to-fail transitions involved a flaky
-test.
+Flaky tests make CI results harder to trust. Reruns waste engineering time and
+CI minutes; past evidence is scattered across workflow executions. An
+explainable comment attached to a PR can give developers useful historical
+context without requiring a separate dashboard.
 
-Commercial tools address this for large organizations. Small teams, student
-projects and most open-source repositories have nothing. GitHub's built-in AI can
-explain a single failed run, but nothing in the default GitHub experience tracks
-a test's **history across runs**, which is what it takes to say "this failure
-probably isn't yours."
+Existing commercial and open-source tools already address parts of this
+problem. The project does **not** claim category novelty. Its early audience is
+small Python projects, student teams and open-source maintainers who value
+low-friction GitHub-native feedback. A few active external installations and
+feedback-driven changes would be meaningful outcomes.
 
 ## 3. Goals and non-goals
 
-**Goals (v1)**
+**Goals (core beta)**
 
-- **G1. Easy setup.** Install the App and add one upload step to CI in under 5
-  minutes.
-- **G2. No lost or duplicated data.** Every available, valid test report from
-  every completed run of a tracked workflow is recorded exactly once, including
-  runs whose webhook delivery initially failed (recovered within GitHub's 3-day
-  redelivery window). Cancelled and timed-out runs are ingested if they produced
-  reports.
-- **G3. Trustworthy detection.** A conservative rule that can be explained in
-  one sentence, with evidence linked in every verdict.
-- **G4. Fast feedback.** The PR comment is created or updated within 60 s (p95)
-  of the webhook *arriving*. GitHub's own delivery delay is measured and
-  reported separately, because it's outside the service's control.
-- **G5. Safe AI enrichment** (after the core beta). Explanations for new
-  failures on public repositories only, added after the comment is posted, under
-  cost caps.
-- **G6. Real deployment.** Runs on AWS, installed on repositories I don't own.
+- **G1. Easy setup for a defined audience.** A maintainer can install the App
+  and add one documented `pytest`/JUnit artifact-upload step. Aim for ~5 minutes
+  on a compatible repository; measure this rather than treating it as guaranteed.
+- **G2. Durable and idempotent accepted work.** For supported workflow events
+  that reach and are recorded by the service, valid accessible reports are
+  retried and stored without duplicate database effects. Tasks may execute
+  more than once. Explicitly expose missing, skipped or rejected reports.
+  **Missed webhooks outside the service are not automatically recovered in v1.**
+- **G3. Trustworthy, limited detection.** Flaky verdicts use deterministic,
+  reproducible historical evidence. The tool distinguishes lack of evidence
+  from absence of observed flakiness and never equates a flaky label with safety.
+- **G4. Observable feedback latency.** Measure webhook-to-comment latency and
+  GitHub delivery delay separately. A 60-second p95 is an *aspirational later
+  target*, not a beta acceptance guarantee.
+- **G5. Real deployment and operations.** Deploy a usable, monitored,
+  containerized product to AWS through Terraform and CI/CD; demonstrate
+  recovery of recorded jobs after a worker failure.
+- **G6. Feedback-driven development.** Test onboarding with an independent
+  repository and invite external maintainers. Three active external
+  repositories is an adoption *target*, not a technical release gate.
 
-**Non-goals (v1)**
+**Supported beta contract**
 
-- CI systems other than GitHub Actions; test formats other than JUnit XML.
-- Automatically quarantining, skipping or retrying tests.
-- **Runs triggered from forks.** They are not ingested at all (§5.6).
-- AI explanations for private repositories.
-- A web dashboard (moved to stretch goals); notifications outside GitHub;
-  billing; org-wide analytics.
+- GitHub Actions only; JUnit XML only; documented **pytest** configuration.
+- Same-repository `push`, `schedule` and `pull_request` workflows (subject to
+  M0 provenance validation), with **one test-producing, non-matrix job and one
+  stable artifact suite per workflow**. Multiple separate workflows may each
+  contribute their own comment section.
+- **Reruns** are in scope because repeated observations are central to flake
+  detection: both **"Re-run all jobs"** and **"Re-run failed jobs"**, as long
+  as the test-producing job actually re-runs in that attempt and its artifact
+  carries that attempt's suffix (§5.3). An attempt in which the test job did
+  not re-run adds no observation and leaves the previous section in place.
+- **PR comments are written only by `pull_request` runs.** `push` and
+  `schedule` runs contribute history but never edit a PR comment, even when
+  their payload lists an open PR.
+- If an event or artifact's commit, PR or attempt provenance is ambiguous,
+  record it as unsupported/skipped rather than guessing.
+
+**Non-goals (core beta)**
+
+- Complex matrix/sharded test jobs, multiple test-producing jobs per workflow,
+  partial reruns whose artifact cannot be tied to one attempt, and
+  mixed-attempt artifact aggregation; more trigger types such as `merge_group`,
+  `workflow_dispatch` and `pull_request_target` until tested and designed.
+- Default-branch comparisons; **"also failing on main"** and **"new failure"**
+  verdicts. These are later feature candidates, not silently renamed to each
+  other.
+- AI-generated explanations, LLM integrations, prompt caching and costs.
+- Raw failure/stack-trace storage, advanced secret redaction, and a web
+  dashboard.
+- CI providers besides GitHub Actions; broad language-specific onboarding
+  beyond pytest; auto-quarantine; notifications outside GitHub; billing.
+- Automated recovery of GitHub webhook deliveries that never reached this
+  service; distributed per-installation API throttling; multi-worker scaling;
+  multi-AZ/high-availability infrastructure; advanced tracing/Sentry.
+- Runs from forked repositories: excluded from ingestion (§5.6).
 
 ## 4. User experience
 
 **Maintainer setup**
 
-1. Install the App from its GitHub page and pick repositories.
-2. Add one step after the tests in each job that produces a report:
+1. Install the GitHub App and select one or more repositories.
+2. For each supported single-job workflow, run pytest with JUnit XML output
+   and upload the result after tests finish. For example (assumes the test
+   command writes to `reports/junit.xml`):
 
    ```yaml
    - uses: actions/upload-artifact@v7
      if: always()
      with:
-       # test-results-<suite>-<attempt>. Matrix jobs put every matrix value in <suite>,
-       # e.g. test-results-unit-${{ matrix.os }}-py${{ matrix.python }}-${{ github.run_attempt }}
+       # One non-matrix test-producing job per supported workflow.
+       # Suffix is mandatory: it ties the report to its run attempt.
        name: test-results-unit-${{ github.run_attempt }}
-       path: reports/            # contains the JUnit XML file(s)
+       path: reports/junit.xml
+       if-no-files-found: error
    ```
 
-   The `<suite>` part keeps different jobs and matrix legs apart. The
-   `<attempt>` suffix tells the App which re-run attempt produced the report
-   (§5.3).
+   The artifact name follows `test-results-<suite>-<attempt>` with a stable
+   `<suite>` (e.g. `unit`). Its suffix is the run attempt. Validate the
+   installed upload action version and real artifact behavior in M0.
+3. On a failed upload or unsupported configuration, use the run logs and
+   documentation for corrective instructions. The service must not pretend an
+   absent report is a passing test run.
 
-**Developer on a PR.** One comment per PR, with one section per workflow,
-edited in place as runs finish:
+**Developer on a PR.** One App-authored comment per PR; one section per
+supported workflow; edits replace the relevant section in place:
 
-> **🧪 `CI` · commit `a1b2c3d`** — 4 of 214 tests failed
+> **🧪 `CI` · tested revision `a1b2c3d`** — 3 of 214 tests failed
 >
 > | Test | Verdict | Evidence |
 > | --- | --- | --- |
-> | `tests/test_auth.py::test_login_expired_token` | ⚠️ Has flaky history | Flipped on identical code 4× in 30 days. Can still be a real failure. |
-> | `tests/test_api.py::test_rate_limit` | 🔴 Also failing on `main` | Latest `main` result failed (`9f8e7d6`) |
-> | `tests/test_cards.py::test_import_variant` | 🆕 New failure | Passed in the latest `main` run |
-> | `tests/test_sync.py::test_backfill` | ❔ Not enough history | No recent `main` result to compare against |
+> | `tests/test_auth.py::test_login_expired_token` | ⚠️ Has flaky history | Passed and failed in 2 supported same-revision groups in 30 days; check linked runs. Current failure may still be real. |
+> | `tests/test_cards.py::test_import_variant` | ◻️ No flaky history observed | 7 prior recorded observations in 30 days, no same-revision flip observed. Not proof of stability. |
+> | `tests/test_sync.py::test_backfill` | ❔ Not enough history | No earlier comparable non-skipped observation in the 30-day window. |
 >
-> **✅ `Lint`** — all 12 reported tests passed on `a1b2c3d`.
+> **✅ `Lint`** — 12 reported tests passed on its current supported revision.
 
-A section only describes its own workflow on the PR's current commit. A missing
-or rejected report is stated explicitly, never shown as a pass.
+Test identities and run/commit evidence are linked where available. The comment
+must state when a supported workflow has a **missing, invalid, rejected or
+unsupported** report; it must never claim an unreported test has passed.
 
 ## 5. Proposed design
 
 ### 5.1 Architecture
 
-```
-GitHub ──webhooks──► web (Django + gunicorn)
+```text
+GitHub ──webhooks──► web (Django + gunicorn, ECS)
                        │ verify HMAC · dedupe delivery GUID
-                       │ INSERT delivery + run (pending) in 1 txn · on_commit → enqueue · 202
-                       ▼
-                     Redis ──► worker (Celery) ──► GitHub REST API (artifacts, PRs, comments)
-                                   │        └────► LLM API (async enrichment, public repos)
-                                   ▼
-                              PostgreSQL (system of record)
-                                   ▲
-       beat (Celery) ──────────────┘  · sweep: re-enqueue stuck runs
-                                      · recovery: redeliver failed webhook deliveries
+                       │ commit delivery + run (pending) in PostgreSQL
+                       └─ on_commit → Redis broker ──► Celery worker (ECS, concurrency=1)
+                                                      │ GitHub REST API
+                                                      │ artifact parser + classifier
+                                                      │ PR comment updater
+                                                      ▼
+                                               PostgreSQL (system of record)
+                                                      ▲
+EventBridge Scheduler ──► short-lived ECS sweep task ──┘
+  (recurring schedule)   re-enqueue stale recorded work; NOT webhook redelivery
 ```
 
-- **web:** verifies, records and returns quickly (GitHub expects a response
-  within ~10 s). It also serves the admin.
-- **worker:** processes runs, posts comments and runs the enrichment and
-  recovery tasks.
-- **beat:** schedules the sweep and webhook recovery.
-- **PostgreSQL:** the system of record. A run row's `status` decides whether
-  work is outstanding, not the broker.
-- **Redis:** broker only. Losing it loses no data.
+- **Web:** handles GitHub webhook verification, durable intake, installation
+  events, health checks and an internal admin surface; responds promptly.
+- **Worker:** one logical worker replica with Celery concurrency 1 in beta,
+  processing ingestion, classification, comments and bounded retries. The
+  worker ECS service deploys with **minimum healthy 0% / maximum 100%**, so
+  the old task stops before the new one starts (ECS's default starts the new
+  task first and would briefly run two workers). A deploy can therefore stop
+  a task mid-job; recovery handles that like any other crash.
+- **PostgreSQL:** canonical delivery, run, artifact, observation and comment
+  records; unique constraints enforce idempotent database effects.
+- **Redis:** task broker only. It is not the system of record.
+- **Recovery:** a recurring **EventBridge Scheduler** schedule launches a
+  short-lived ECS task (same image, a Django management command) that finds
+  old `pending` runs and `processing` runs whose claim is older than the hard
+  task time limit plus a safety margin, re-enqueues them and exits. No
+  always-running Celery Beat service; no scheduler embedded in the worker; no
+  GitHub delivery polling.
+- **AWS:** one image for web, worker and scheduled management command;
+  ECR/ECS Fargate, RDS PostgreSQL, a suitably sized Redis broker, ALB/HTTPS,
+  IAM/Secrets Manager, CloudWatch and Terraform. Cost, broker topology and
+  network placement must be finalized before production provisioning.
 
 ### 5.2 Event flow for one workflow run
 
-1. **Receive.** Verify `X-Hub-Signature-256` over the raw body (size-capped).
-   Ignore everything except `workflow_run.completed` and installation events. If
-   the run's head repository differs from the base repository, it's a fork run:
-   record the delivery and stop (§5.6).
-2. **Record.** In **one transaction**, insert the delivery GUID (duplicate →
-   return 200) and upsert the run attempt `(run_id, run_attempt)` as `pending`.
-3. **Enqueue.** `transaction.on_commit` enqueues `process_run`, so the task can
-   never run before the row exists.
-4. **Claim.** A conditional update sets `processing`, a fresh `claim_token` and
-   `claimed_at`, and **commits before any network call**. It succeeds only if the
-   run is `pending`, or `processing` with an expired lease. Every later write
-   checks the claim token, so a stale worker can't overwrite a newer one. The
-   claim also checks that the repository and installation are still active.
-5. **Discover reports.** List *all* pages of the run's artifacts and filter names
-   client-side by the `test-results-` prefix. Parse each name into suite and
-   attempt, and keep only artifacts produced by **this** attempt (§5.3). Skip
-   artifacts already marked complete.
-6. **Ingest each artifact.** Stream the download to a temp file and decompress
-   in a streaming fashion, enforcing per-artifact and **per-run** limits on
-   bytes, files, test cases, field lengths and time. Parse incrementally. Redact
-   failure text, then store the results **and** mark the artifact complete in
-   **one transaction**. If a limit is hit, record the artifact as rejected with
-   the reason; the run ends as `partial`.
-7. **Detect.** Under a per-repository advisory lock, record new flake events
-   (§5.4).
-8. **Comment.** Only for `pull_request` runs on same-repository PRs, and only if
-   the run's commit is still the PR's current head; results for older commits
-   are stored but don't change the comment. Render this workflow's section and
-   upsert the sticky comment (§5.5).
-9. **Finish.** Mark the run `processed` or `partial` (claim token checked). After
-   the core beta, enqueue `explain_failures` for new failures on public repos.
-   It edits the comment later, only if the PR head hasn't moved.
-10. **Retries.** Transient errors retry with exponential backoff and jitter, up
-    to 5 times, honoring GitHub's rate-limit signals (§5.7). Permission errors
-    don't retry. After the final failure, the run is marked `failed` with the
-    error.
-11. **Safety nets (beat):**
-    - **Sweep** (every 5 min): re-enqueue runs `pending` for over 5 min, or with
-      an expired lease. The lease is longer than the task's hard time limit,
-      which is longer than its soft limit.
-    - **Webhook recovery** (every 10 min): page through the App's recent
-      deliveries from a stored cursor and redeliver any that failed. A
-      redelivery reuses the GUID, so step 2 dedupes it. Alert if failures
-      persist or recovery falls behind GitHub's 3-day redelivery window.
+1. **Receive.** Verify `X-Hub-Signature-256` against the size-limited raw
+   webhook body. Only supported `workflow_run.completed` and installation/
+   repository lifecycle events proceed. Reject unsupported/fork provenance
+   conservatively (§5.6).
+2. **Record.** In one database transaction, dedupe the GitHub delivery GUID
+   and upsert `(run_id, run_attempt)` as a pending run. A repeated delivery
+   must not create duplicate work or results.
+3. **Enqueue.** Use `transaction.on_commit` to publish a Celery task. This
+   prevents the worker seeing uncommitted rows but is **not** an atomic
+   PostgreSQL-to-Redis operation. The scheduled sweep addresses recorded runs
+   that were committed but not queued.
+4. **Process with bounded execution.** Use a single worker, a conditional
+   database claim, task time limits, late acknowledgement where appropriate
+   and idempotent writes. A crashed or lost task may run again, and a broker
+   may redeliver a message after its visibility timeout. A claim that fails
+   (run already claimed or finished) makes the task a no-op.
+   - **Claim:** a conditional update moves the run to `processing` and records
+     the claim time (`claimed_at`); it commits before any network call.
+   - **Conditional final write:** the update that records the outcome only
+     succeeds if the run is still `processing` *with the same claim the task
+     took*. If the sweep has since re-enqueued the run and a newer execution
+     claimed it, the stale execution's final write matches nothing and is
+     discarded. This stops a stale worker from overwriting completed job
+     state; observation writes stay idempotent through unique constraints.
+   - **Sweep threshold:** the sweep never re-enqueues a `processing` run
+     until its claim is older than the hard time limit plus a safety margin.
+   - **Deferred:** full multi-worker leases with heartbeats and separate
+     claim tokens. This design is not presented as safe for arbitrary worker
+     scaling.
+5. **Discover supported reports.** Page through the run's artifacts, select
+   `test-results-<suite>-<attempt>`, verify the attempt suffix equals the
+   current run attempt and enforce one supported suite per workflow. For a
+   "Re-run failed jobs" attempt, check (per M0 findings) whether the
+   test-producing job ran in this attempt: if it did, its suffixed artifact
+   is required; if it did not, record "no new observation" rather than a
+   missing report. Skip ambiguous/mixed-attempt or matrix cases with a reason.
+6. **Safely ingest.** Fetch under a strict network timeout and input-size cap.
+   Bound compressed bytes, decompressed bytes, XML files, test cases, field
+   lengths and processing time. Use safe XML parsing; do not extract archive
+   paths to disk unchecked. Store test identifiers, outcomes and optional
+   timing only; **discard failure text and stack traces**. In a transaction,
+   save observations and mark an artifact complete, using unique constraints.
+   Mark rejected or missing reports explicitly.
+7. **Classify.** Compute or incrementally store same-revision flake events
+   according to §5.4. No default-branch regression comparison.
+8. **Update comment.** Only `pull_request` runs from the same repository
+   update a comment. Verify the run's `head_sha` matches the PR's current head
+   commit, then update only its workflow section. Serialize
+   read/modify/write activity for a PR (§5.5). On uncertain association or a
+   stale head, store the data but do not publish a misleading comment.
+9. **Finish.** Persist `processed`, `partial`, `unsupported`, `rejected` or
+   `failed` outcome as appropriate, together with a bounded diagnostic code.
+   Never log or retain raw assertion output.
+10. **Retry.** Transient GitHub/network errors retry with bounded exponential
+    backoff and jitter. Respect primary/secondary rate-limit signals.
+    Permanent permissions errors are surfaced and not blindly retried.
+11. **Recover recorded work.** The scheduled sweep re-enqueues eligible stale
+    pending/processing rows after respecting task timeouts. Test a worker
+    termination and a commit-before-enqueue failure. This does not recover
+    GitHub webhook deliveries that never reached the app; operators may use
+    GitHub's manual redelivery interface where available.
 
 ### 5.3 Identity and provenance
 
-- **Test identity** = repository + **workflow ID** + suite + test key
-  (`file::classname::name`). The suite comes from the artifact name. Attempt
-  numbers and sharding never enter identity, so the same test across attempts
-  and shards is one test, while a CI workflow and a nightly workflow stay
-  separate.
-- **Observation** = one test in one run attempt. Repeated entries in one report
-  (runner-level retries) are aggregated into pass/fail/skip counts, not
-  collapsed.
-- **Provenance:** the artifact API doesn't say which attempt produced an
-  artifact, and a partial re-run can list earlier attempts' artifacts. The
-  attempt therefore comes from the **artifact name suffix**. Fallback for
-  artifacts without a suffix: accepted only when `run_attempt = 1`, where
-  there's no ambiguity; otherwise skipped, and the comment explains how to add
-  the suffix.
-- **Time:** windows and recency use the run's **start time**, never when we
-  ingested it, so delayed or recovered data doesn't look recent.
+- **Test identity:** repository ID + workflow ID + stable suite + test key
+  (`file::classname::name`). Attempts are observations, not distinct tests.
+  Matrix dimensions/sharding are not supported in the beta identity contract.
+- **Observation:** one test in one accepted run attempt; repeated entries
+  from a test runner (if emitted in JUnit) retain pass/fail/skip counts rather
+  than silently overwriting one another. Skips do not establish flakiness.
+- **Artifact provenance:** accept only an unambiguous
+  `test-results-<suite>-<attempt>` artifact matching the run attempt. GitHub's
+  artifact records do not say which attempt uploaded them, so the name suffix
+  is the only provenance; do not infer it from creation time or list order.
+  Reruns ("Re-run all jobs" and "Re-run failed jobs") are supported **only
+  if** M0 verifies the naming/listing behavior and a reliable way to tell
+  whether the test-producing job ran in a given attempt. A stale suffix (e.g.
+  `-1` on attempt 2) is not the current attempt's report. Missing suffixes or
+  ambiguous combinations are rejected/skipped with actionable instructions.
+- **Revision provenance:** two separate questions.
+  - *Which PR head does a run belong to?* For `pull_request` runs,
+    `workflow_run.head_sha` is expected to be the PR's head commit (confirm
+    in M0). Comparing it with the PR's current `head.sha` is the staleness
+    check for comments.
+  - *What code was tested?* A `pull_request` run tests a merge of the PR head
+    into the base; that merge commit is not in the webhook payload. Reruns
+    are expected to reuse the original run's commit, so attempts of one run
+    test the same code; this is why PR runs are grouped by `run_id` (§5.4).
+    M0 confirms this by printing `$GITHUB_SHA` and `git rev-parse HEAD` in
+    each attempt.
+  - If either answer is uncertain for a run, store the data but don't comment.
+- **Time:** 30-day windows use workflow run start time, not ingestion time.
+  Late reports do not count as newly run tests.
 
 ### 5.4 Flake detection
 
-**Identical-code groups.** Each observation belongs to exactly one group:
+**Supported same-revision grouping** (subject to M0 validation):
 
-| Trigger | Group | Why |
+| Trigger | Comparison group | Qualification |
 | --- | --- | --- |
-| `push`, `schedule` | `sha:<workflow>:<head_sha>`, covering all runs and attempts on that commit | Same workflow, same commit, no inputs |
-| `pull_request`, `pull_request_target`, `merge_group`, `workflow_dispatch` | `run:<run_id>`, covering only attempts of that run | A PR run tests a temporary merge commit that changes as the base moves; dispatch inputs can change behavior |
+| `push`, `schedule` | `(repository, workflow, suite, head_sha)` across supported runs and rerun attempts in which the test job ran | Same revision *under the documented checkout contract*; not guaranteed identical external environment/dependencies |
+| `pull_request` | `(repository, workflow, suite, run_id)` across rerun attempts in which the test job ran | Attempts of one run are expected to test the same merge commit; validate in M0 before enabling |
 
-One canonical group per observation means a re-run of a push run can't be
-counted twice.
+Only workflows that check out the expected triggering revision are supported.
+Changing runtime dependencies, external services or secrets can influence
+results even with an unchanged commit. A verdict describes an observed
+same-revision outcome flip, not a proof that the environment was identical.
 
-**Supported contract:** the workflow checks out the triggering commit (the
-default `actions/checkout` behavior). Workflows that check out other refs aren't
-supported, and the README says so.
+**Rules:**
 
-**Rules**
+- **Flake event:** the same test has at least one passing and one failing
+  occurrence in one supported comparison group (possibly within one attempt
+  if the report captures runner-level retries). Count a group at most once.
+- **Has flaky history:** at least `FLAKY_MIN_EVENTS = 1` event in the last
+  `FLAKY_WINDOW_DAYS = 30` days, with evidence linking the relevant runs.
+- **History used for other verdicts:** a previous, distinct accepted run
+  attempt for the test within the 30-day window, excluding the current
+  attempt. This measures historical observations, not default-branch health.
 
-- **Flake event:** a group in which the test has at least one passing and at
-  least one failing occurrence, including both within one attempt. Skips are
-  ignored. One event per (test, group), timestamped by the run start time.
-- **Has flaky history:** at least `FLAKY_MIN_EVENTS` events (default 1) within
-  `FLAKY_WINDOW_DAYS` (default 30).
+**Verdicts for each failed test, in precedence order:**
 
-**Verdicts** for each failed test on the PR's current head, checked in order:
+1. ⚠️ **Has flaky history:** observed a supported same-revision pass/fail flip.
+   Does **not** clear the current PR of a real defect.
+2. ❔ **Not enough history:** no earlier eligible, non-skipped observation in
+   the 30-day window and no qualifying flake event.
+3. ◻️ **No flaky history observed:** at least one earlier observation exists,
+   but no supported same-revision flip was recorded. This does **not** mean
+   the test is stable, and **does not** mean the PR introduced a regression.
 
-1. ⚠️ **Has flaky history**: the rule above. The wording never claims the
-   current failure is harmless.
-2. ❔ **Not enough history**: no non-skipped default-branch result for this test
-   within the window. This covers new installs, renamed tests and PR-only
-   suites.
-3. 🔴 **Also failing on main**: the latest non-skipped default-branch result
-   failed.
-4. 🆕 **New failure**: the latest default-branch result passed.
+The comment must show the observation count and window when relevant.
+Post-beta work may add default-branch baseline comparison and associated
+new-failure/also-failing-on-main verdicts, with a separate design review.
 
 ### 5.5 PR comment
 
-- One comment per PR, identified by a hidden marker. Its ID is stored after
-  creation. **Before creating a comment**, the worker searches the PR's comments
-  for an App-authored marker; this covers a crash between "GitHub accepted the
-  POST" and "ID saved."
-- Each workflow owns one section, keyed by workflow ID. A section is replaced
-  only by a run for the PR's current head that started later than the run
-  currently shown, so out-of-order deliveries can't roll it back.
-- All text from reports or the model is rendered inside code spans or blocks,
-  with backticks escaped, `@mentions` neutralized and links not auto-rendered.
+- **One comment per PR**, identified by a hidden stable marker. Save the
+  GitHub comment ID; before creating, search for an existing App-authored
+  marker to handle a crash after GitHub accepts a POST but before the ID is
+  persisted.
+- **Serialize comment updates:** the beta uses the one-concurrency worker
+  and a per-PR PostgreSQL advisory lock around the comment's read/modify/
+  write operation to protect accidental overlapping tasks or deployments.
+  Bound API-call duration and lock wait. This is a simple correctness guard,
+  not a scaling architecture. Test simultaneous creation and updates.
+- **Only `pull_request` runs write comments.** Many workflows trigger on both
+  `push` and `pull_request`, producing two runs per commit with the same
+  workflow ID; a `push` run's payload can also list the open PR. Letting both
+  write would make the same section flip between runs. `push`/`schedule`
+  runs feed history only.
+- **Per-workflow sections** are keyed by workflow ID; update only from an
+  eligible current-head run and prevent an older eligible execution from
+  replacing a newer section. An attempt that adds no observation (test job not
+  re-run) leaves the section unchanged.
+- **Untrusted text** (test names, suite names and report metadata) is safely
+  escaped in GitHub Markdown. Neutralize mentions and unsafe links; no
+  failure-output or model-generated text is rendered.
 
 ### 5.6 Trust, forks and installation lifecycle
 
-- **Forks:** runs whose head repository differs from the base repository are not
-  ingested. The check compares repository IDs from the payload; an empty PR list
-  is never treated as proof either way. Without this, untrusted XML from a fork
-  could create flake events for the base repository's tests.
-- **Lifecycle:** handle installation created, deleted, suspended and
-  unsuspended, and repositories added or removed. On any change to repository
-  selection, **re-sync** the accessible repository list from the API instead of
-  trusting the event's diff. Uninstall deletes all of that installation's data;
-  removing a repository deactivates it and deletes its data. Queued work for an
-  inactive repository exits at the claim step and can't recreate deleted rows
-  (foreign keys plus the claim check). Suspension invalidates cached tokens.
+- **Fork runs:** reject/skips if head repository differs from the base
+  repository. Validate repository IDs from supported payloads. A missing
+  `pull_requests` list is not proof a run is safe.
+- **Lifecycle:** handle installation creation, deletion and suspension;
+  repository additions/removals with basic state changes. Check installation
+  and repository access before processing or commenting. Revoked access
+  stops new processing; uninstall and repository removal delete relevant
+  persisted data. Token cache entries are invalidated on revocation.
+- **Deferred:** automatic full accessible-repository resynchronization on
+  every selection change and advanced multi-replica token cache
+  coordination. When event state is ambiguous, fail closed and verify access
+  against GitHub rather than processing with stale assumptions.
 
 ### 5.7 GitHub API client
 
-- Read every page of every list (`per_page=100`, following `Link` headers).
-  Filter artifact names client-side; the API's `name` filter is exact-match only.
-- **Primary rate limit:** when the remaining quota is 0, wait until the reset
-  time.
-- **Secondary rate limits:** honor `Retry-After`, otherwise back off for at least
-  60 s, increasing on each retry. Backoff is shared per installation (stored in
-  Redis), so concurrent tasks don't keep hammering the API.
-- Permission errors (401/403 without rate-limit signals) are failures, not
-  retries, and are surfaced in the admin.
+- Paginate all relevant list endpoints and filter artifact names client-side.
+- Respect primary quota/reset information and `Retry-After` or GitHub's
+  secondary-rate-limit guidance, using bounded exponential retries.
+- Treat 401/403 without applicable rate-limit signals as access/permission
+  failures; surface actionable status without endless retries.
+- **Deferred:** distributed per-installation Redis backoff shared among many
+  workers, because the beta has one logical worker.
 
 ### 5.8 Module layout
 
 ```text
-config/       Django project: settings, urls, celery.py, wsgi
-core/         health check, shared helpers (redaction, markdown escaping)
-webhooks/     view + signature check · Delivery model · installation lifecycle · delivery recovery task
-githubapp/    App JWT, installation-token cache, REST client (pagination, rate limits)
-ingest/       Run, Artifact, Test, TestResult models · tasks.py · artifacts.py (stream, limits) ·
-              junit.py (incremental parse) · store.py
-detection/    FlakeEvent model · flakes.py · verdicts.py
-comments/     PrComment model · render.py · sticky.py
-explain/      AiExplanation model · llm.py · prompts (after the core beta)
-infra/        Terraform
+config/       Django settings, urls, celery.py, wsgi
+core/         health check, safe Markdown rendering helpers
+webhooks/     webhook view, signature check, Delivery model, lifecycle handling
+              and durable-run recovery management command
+githubapp/   App JWT, installation token handling, REST client (pagination,
+              rate-limit responses)
+ingest/       Run, Artifact, Test, TestResult models, tasks, artifact limits,
+              safe junit parsing, transactional storage
+detection/    FlakeEvent model, grouping and verdict classification
+comments/     PrComment model, render, serialize/upsert sticky comments
+infra/        Terraform + ECS task/service definitions
 ```
 
-`junit.py`, `flakes.py`, `verdicts.py`, `render.py` and the redaction helpers
-are pure logic with no network calls, so they can be unit tested with fixtures.
+This is a **proposed logical layout**, not a claim the scaffold already
+contains these modules. Keep parsing, classification and rendering logic
+separable from network calls for deterministic unit testing.
 
-## 6. Alternatives considered
+## 6. Alternatives considered and current decisions
 
-| Decision | Chosen | Alternatives | Why |
+| Decision | Proposed v1 approach | Alternative / deferred approach | Reason |
 | --- | --- | --- | --- |
-| **D1. Integration model** | GitHub App + `workflow_run` webhook | GitHub Action that POSTs results; polling the Actions API | No secrets in user repos, native re-run visibility, comments as itself. Polling wastes rate limit and adds delay. |
-| **D2. Result source** | JUnit XML artifacts with a naming convention | Raw job logs; check-run annotations | JUnit is near-universal and structured. The naming convention is the only reliable way to get provenance (§5.3). Cost: one CI step (R1). |
-| **D3. Background jobs** | Celery + Redis; run row as source of truth; `on_commit` + sweep | Postgres `SKIP LOCKED` queue; Django 6 Tasks; SQS; RQ | Standard Python job stack with retries, time limits and scheduling. The Postgres–Redis dual-write gap is closed by the sweep (§5.2 step 11). |
-| **D4. Flaky definition** | Outcome flip within an identical-code group | Failure-rate threshold; statistical model | Conservative and explainable, with no threshold to justify before there's data. |
-| **D5. PR output** | One sticky comment, one section per workflow | Check Run; commit status | Most visible. Per-workflow sections avoid false global "all passing" claims. |
-| **D6. Web framework** | Django | FastAPI + SQLAlchemy; Go | Familiar language; admin as an internal tool; covers both major Python frameworks across my projects. |
-| **D7. Compute** | ECS Fargate, one image, three services | EC2; Lambda + SQS; EKS | No servers to patch. Lambda has cold starts and Postgres connection issues; EKS is too costly for one small service. |
-| **D8. AI use** | Async enrichment, new failures only, public repos only, per-repo cache | Every failure; private repos with redaction; none | Verdicts come from data. Public-only avoids promising privacy that regex redaction can't guarantee. Async keeps G4. |
-| **D9. Infrastructure** | Terraform | Console click-ops; AWS CDK | Reviewable, repeatable, destroyable; most widely used IaC tool. |
-| **D10. Tooling** | uv, Ruff, strict mypy, pytest-django | pip; flake8/black; no types | Lockfile, fast installs, early bug detection. |
-| **D11. Missed webhooks** | Scheduled redelivery of failed App deliveries | Reconcile against the Actions runs API; accept loss | GitHub's recommended approach. It reuses the normal intake path, and dedupe makes it safe. Limit: 3-day window, hence alerting. |
-| **D12. Fork runs** | Ignore in v1 | Ingest into an isolated, untrusted history | Simplest safe option. Isolation adds a trust dimension to every query; revisit if fork-heavy users need it. |
+| **D1. Integration model** | GitHub App + `workflow_run` webhook | GitHub Action POST; bulk polling | Native installation model and artifact access; M0 validates event semantics. |
+| **D2. Result source** | JUnit XML in attempt-suffixed artifacts, one suite/job | Log scraping; matrix and multi-job association | Structured and testable; conservative provenance. |
+| **D3. Background jobs** | Celery + Redis, PostgreSQL source of truth, on-commit enqueue + scheduled sweep, one worker, conditional claim and conditional final write | SQS, Postgres queue, full leases with heartbeats/claim tokens for multiple workers; no final-write guard | Demonstrates async jobs/idempotency; the final-write guard stops a stale execution overwriting completed state at the cost of one condition. |
+| **D4. Flake definition** | Same-revision observation flip with caveat about environment | Failure-rate model, dependency/environment fingerprinting | Transparent evidence, appropriately conservative claims. |
+| **D5. Output** | One sticky comment with per-workflow sections and per-PR serialization; written only by `pull_request` runs | Check runs, per-run comments, separate dashboard; comments from `push` runs | GitHub-native visibility and tractable concurrency correctness; one writer per section avoids push/PR flip-flops. |
+| **D6. Framework** | Django + PostgreSQL | FastAPI + SQLAlchemy, Go | Django admin and Python depth complement existing projects. |
+| **D7. Cloud topology** | ECS Fargate web + one worker (stop-before-start deploys), EventBridge Scheduler launching a short-lived recovery task, RDS, Redis, ALB | Always-on Beat service; scheduler embedded in the worker (`celery worker -B`); autoscaling, multi-AZ, EKS | Real AWS/platform work, including managed scheduling, without beta-scale overhead. Embedded Beat would be less Terraform but teaches less. |
+| **D8. AI** | **No AI in beta**; possible user-requested follow-up | Async LLM explanation, prompt cache, redaction | Low relevance to core detection and disproportionate scope. |
+| **D9. IaC** | Terraform + OIDC CI/CD | Console provisioning, CDK | Reproducible cloud deployment and useful infra learning. |
+| **D10. Tooling** | uv, Ruff, mypy, pytest-django | pip, flake8/black, untyped code | Automated repeatable quality checks. |
+| **D11. Missed webhooks** | No automatic redelivery; manual recovery when feasible; honest limitation | GitHub deliveries API polling/redelivery and reconciliation | Focus on durable recovery of recorded jobs first. |
+| **D12. Forks** | Exclude fork-origin runs | Trust-isolated fork histories | Avoid mixing untrusted inputs into trusted evidence. |
+| **D13. Verdicts** | Flaky / insufficient history / no flakiness observed | Default-branch baseline and "new failure" | Do not claim regression status without baseline analysis. |
+| **D14. Beta integrations** | pytest example, single non-matrix suite per workflow, "Re-run all jobs" and "Re-run failed jobs" when the test job re-runs | Jest, Go, full reruns only, matrix/shards | "Re-run failed jobs" is how developers usually retry a flaky failure; supporting it keeps the tool useful without widening the job shape. |
+| **D15. Failure data** | Store test identity/outcome/time and provenance only | Raw failure text, advanced redaction, AI | Lower privacy risk, simpler trustworthy product. |
+| **D16. Observability** | CloudWatch logs, health checks, essential alarms/metrics | Sentry, distributed tracing, elaborate dashboards | Enough evidence to operate and debug the beta. |
+
+These decisions remain **proposed** until approved; copy significant accepted
+tradeoffs into the future `DECISIONS.md` without duplicating the whole RFC.
 
 ## 7. Security and privacy
 
-- **Webhooks:** HMAC-SHA256 over the raw body, constant-time comparison,
-  request size cap.
-- **Permissions:** least privilege — Actions *read*, Pull requests *read &
-  write* (also covers PR comments), Metadata *read*. No repository contents.
-- **Untrusted input:** artifacts and reports are hostile until parsed. Streaming
-  download and decompression, aggregate per-run limits, `defusedxml`
-  incremental parsing, bounded field lengths and nesting, processing deadlines,
-  and explicit `rejected`/`partial` outcomes. Exact limits are in `DESIGN.md`.
-- **What is stored (stated accurately in the README):** test identifiers,
-  outcomes, durations and the first 4 KB of failure output. Failure output can
-  include source snippets or data printed by tests. Redaction of token-like
-  strings is **best-effort** and runs before storage, logging, rendering and
-  any model call.
-- **AI:** public repositories only. Model output is treated as untrusted text
-  (§5.5). The cache is per repository, expires, and is deleted with the
-  repository.
-- **Data deletion:** uninstalling, or removing a repository, deletes its data
-  through cascading foreign keys.
-- **Secrets:** AWS Secrets Manager in production and an untracked `.env`
-  locally. CI deploys through GitHub's OIDC role, so there are no long-lived AWS
-  keys.
-- **Django hardening:** HTTPS redirect (except `/healthz`), secure cookies,
-  HSTS; `check --deploy` in the release pipeline.
+- **Webhooks:** HMAC-SHA256 verification over the original raw body,
+  constant-time comparison, request size cap.
+- **Permissions:** minimize GitHub App permissions (Actions read; relevant PR
+  comment write and metadata permissions), verify exact requirements in M0.
+  Do not request repository contents permission unless justified.
+- **Untrusted artifacts:** never trust compressed archives or XML. Enforce
+  compressed/decompressed total-byte caps, file/count/field limits, timeouts,
+  safe ZIP member handling, and entity-expansion-safe XML parsing. Full
+  streaming optimization is deferred, **not** essential input safety.
+- **Data minimization:** retain test identities, outcomes, durations (where
+  present), workflow/commit provenance and generated verdict evidence. Do not
+  store or log failure messages, tracebacks, source snippets, raw reports or
+  LLM data. Delete temporary archives promptly; test names themselves may
+  contain unexpected content, so escape and limit them.
+- **Lifecycle and isolation:** installation/repository IDs are part of
+  authorization and data boundaries. Reject events after access revocation;
+  delete repository data on removal and installation data on uninstall.
+- **Secrets:** AWS Secrets Manager for deployment, untracked `.env` locally;
+  use GitHub OIDC for deployment rather than permanent AWS keys.
+- **Django hardening:** HTTPS, appropriate secure cookies and HSTS, and
+  `check --deploy` validation in CI. Protect the internal admin.
 
 ## 8. Risks and mitigations
 
-| # | Risk | L | I | Mitigation |
+| # | Risk | Likelihood | Impact | Mitigation |
 | --- | --- | --- | --- | --- |
-| R1 | Users won't add the upload step or naming convention | Med | High | Copy-paste snippets for pytest, Jest and Go; the comment explains exactly what's missing |
-| R2 | False "flaky" labels erode trust | Med | High | Identical-code groups, "not enough history" verdict, cautious wording, evidence links; audit before launch |
-| R3 | Artifact behavior across attempts differs from assumptions | Med | Med | Naming-based provenance; M0 spikes cover full and partial re-runs and delayed processing |
-| R4 | GitHub rate limits | Low | Med | Pagination-aware client, shared backoff per installation (§5.7) |
-| R5 | Sensitive data in failure output | Med | High | Accurate disclosure, best-effort redaction everywhere, AI only on public repos |
-| R6 | LLM cost or latency | Low | Med | Async, capped, cached per repo; comment never waits on it |
-| R7 | **Schedule:** ~10 h/week alongside classes, Cardfolio and applications | High | High | Hour-based plan (§10), cut list, decision checkpoint on Dec 6 |
-| R8 | Hosting cost | Low | Low | Smallest sizes, 90-day retention, `terraform destroy` when idle |
-| R9 | Django, Celery and Terraform are new | Med | Med | Scaffold already wired; one new tool per milestone |
-| R10 | Run saved but never enqueued | Low | Med | `on_commit` + sweep; idempotent processing |
-| R11 | Webhooks missed for longer than GitHub's 3-day window | Low | Med | Recovery every 10 min; alerts on persistent failures or lag |
-| R12 | Out-of-order or duplicate events corrupt the comment | Med | Med | Head-SHA and start-time checks per section; marker lookup before create |
+| R1 | Maintainers do not complete the upload step | Med | High | One verified pytest snippet; actionable setup/missing-artifact errors; onboarding trial |
+| R2 | Flaky classifications are misleading | Med | High | Explicit comparison groups, clear non-regression wording, deterministic fixtures and manual evidence audit |
+| R3 | Rerun artifact provenance (full or failed-jobs), test-job detection per attempt, or PR merge-commit assumptions fail | Med | High | M0 live spikes; fail closed; if failed-jobs reruns can't be attributed reliably, fall back to full reruns only before M2 |
+| R4 | GitHub delivery never reaches service | Med | Med | Explicit beta limitation; manual delivery redelivery or later reconciliation; no completeness guarantee |
+| R5 | Dangerous archive, oversized report or sensitive identifiers | Med | High | Safe parser, bounded inputs, no failure text retention, escaping and tenant isolation |
+| R6 | Worker crashes, is stopped mid-job by a deploy, or enqueue publishing fails | High | High | Durable run rows, idempotent writes, time limits, conditional final write, scheduled stale-run sweep and fault injection (run in a Linux container; Celery time limits are not enforced under `--pool=solo`) |
+| R7 | School, job applications and new tooling extend timeline | High | High | Hour ranges, scope freeze, resume-ready local checkpoint, re-estimate each milestone |
+| R8 | AWS fixed costs exceed beta budget | Med | High | Up-front cost estimate/cap, AWS Budget alerts, minimum viable service sizes, teardown plan |
+| R9 | Unintended second worker (e.g. overlapping deploy) causes duplicate comment updates or stale state writes | Med | High | Stop-before-start worker deploys, conditional final write, PR-scoped serialization, duplicate/stale tests, explicit scaling boundary |
+| R10 | Uninstalled or removed repo continues to be processed | Med | High | Permission checks, lifecycle deactivation, data deletion, bounded token lifetime |
+| R11 | API rates/permissions stop processing | Med | Med | Pagination, GitHub response-aware backoff and actionable errors |
+| R12 | Observability too weak to debug service failures | Med | Med | Structured logs, health checks, queue/backlog and failure visibility in CloudWatch |
 
-**Cut list (in order):** AI enrichment → "also failing on main" (folds into
-"new failure"). The **must-ship core** is reliable ingestion + flake detection +
-sticky comment, deployed and used by at least one external repository.
+**Scope guard:** Do not sacrifice webhook verification, safe parsing,
+installation access checks, database idempotency, comment correctness or
+recorded-work crash recovery to meet an arbitrary deadline. If behind, limit
+compatible workflow shapes first and move optional polish/user-requested
+features later.
 
-## 9. Success metrics
+## 9. Success metrics and release criteria
 
-- **Reliability:** across 500+ processed runs, zero lost or duplicated runs,
-  checked by reconciling against GitHub's run list. p95 processing time ≤ 60 s
-  from webhook receipt; GitHub's delivery delay reported separately.
-- **Accuracy:** in a manual audit of up to 20 tests with flaky history, at least
-  90% are genuinely flaky.
-- **Beta:** at least 3 external repositories (not mine) installed by the
-  core-beta date.
-- **Later outcomes, not launch gates:** 10+ repositories, 1,000+ runs, and LLM
-  cost under $1/day.
+**Engineering gates (controlled by the project):**
 
-## 10. Plan
+- **Local end-to-end demo:** a real supported GitHub Actions workflow emits a
+  report; the app stores results, reproduces an intentional flake through full
+  reruns, and updates exactly one PR comment with evidence.
+- **Correctness:** automated fixtures cover flake, no-flake, insufficient
+  history, unsupported attempts, duplicate deliveries, stale PR heads,
+  comment races and rejected artifacts. Unsupported results never appear as
+  passes or regressions.
+- **Recovery:** a duplicate task creates no duplicate database effects; a
+  terminated worker or lost enqueue is recovered for **already-recorded** runs;
+  a stale execution finishing after a newer one cannot overwrite the recorded
+  outcome. Do not claim general exactly-once task execution.
+- **Cloud/operations:** AWS deploy is provisioned through Terraform, CI/CD
+  authenticates via OIDC, health/logging/at least one useful alert is verified,
+  and the application can be redeployed from documented steps.
+- **Observability:** record processing duration, errors/retries, backlog age,
+  and webhook-to-comment latency. Set numerical service objectives after
+  observing real load, not before.
 
-Capacity: about 10 hours a week (2–3 h × 4 days). Winter break may run
-faster.
+**Adoption outcomes (not release gates):**
 
-| Milestone | Est. | Dates | Scope | Exit criteria |
+- One independent maintainer attempts onboarding and gives concrete feedback.
+- Aim for ~3 external active repositories, 1–2 developer-requested fixes or
+  enhancements, and eventually a longer-running load sample. These are targets,
+  not prerequisites for calling the technical beta complete.
+- A 500+ run reconciliation study and a formal precision target are **future
+  validation work**, not automatic claims of reliability or accuracy.
+
+## 10. Plan and resume-ready checkpoints
+
+Planning capacity: approximately **10 focused hours/week** (may vary with
+finals, other projects and recruiting). Estimates below include code review,
+manual verification and learning time; ranges are not guarantees. Dates are
+provisional and must be reset when a spike or deployment blocker invalidates
+an assumption. **M0 is already underway; do not restart it.**
+
+| Milestone | Effort | Target window | Scope | Exit criteria |
 | --- | --- | --- | --- | --- |
-| **M0** Setup & spikes | 6 h | Oct 22 – Nov 8 (alongside Cardfolio's deploy) | Register the App; capture real payloads as fixtures; spikes (§13) | Spike findings recorded; fixtures committed |
-| **M1** Webhook intake | 10 h | Nov 9 – 15 | Models + migrations + admin; webhook view; dedupe; fork skip; installation lifecycle | Redelivery creates no duplicate; lifecycle tests pass |
-| **M2** Ingestion worker | 18 h | Nov 16 – Dec 6 *(Thanksgiving)* | Claim/lease, retries; GitHub client (JWT, tokens, pagination, rate limits); artifact discovery + provenance; streaming limits; incremental parser; transactional storage | Real playground runs stored; re-processing changes nothing; killing the worker mid-run loses nothing |
-| **M3** First deploy | 14 h | Dec 7 – 20 *(finals, then break)* | Terraform (ECR, ECS ×3, RDS, Redis, ALB/HTTPS, Secrets Manager); CI/CD via OIDC; CloudWatch alarms; Sentry; webhook recovery task | App runs in AWS and collects real history from the playground and Cardfolio while detection is built |
-| **M4** Detection & comments | 14 h | Dec 21 – Jan 3 *(break)* | Groups and flake events; verdicts; per-workflow sticky comment; stale-head handling | Correct verdicts on the playground, including "not enough history" |
-| **M5** Hardening → **core beta** | 8 h | Jan 4 – 10 | Acceptance tests (below); README, setup snippets; first external installs | Core beta live with ≥ 3 external repos |
-| **M6** AI enrichment & launch | 10 h | Jan 11 – 24 | Public-repo explanations (async, cached, capped, evaluated); demo GIF; launch posts | v1 launched |
+| **M0. Setup & spikes** | ~8–9 h total | Oct 22 – Nov 8 | Existing scaffold and RFC; register App; webhook tunnel to the local machine; capture real payloads; test full and failed-jobs rerun artifacts and PR commit association; reconcile `DESIGN.md` with rev. 5 (~2–3 h, §16) | Findings and sanitized fixtures recorded; unsupported assumptions called out; `DESIGN.md` matches the approved RFC |
+| **M1. Durable webhook intake** | 8–12 h | Nov 9 – 15 | Installation state, signature check, delivery/run models and migrations, webhook dedupe, basic fork and revocation checks | Repeated delivery creates one recorded attempt; lifecycle/security tests pass |
+| **M2. Ingestion and background jobs** | 18–25 h | Nov 16 – Dec 6 | GitHub auth/API pagination, Celery/Redis, artifact provenance, bounded safe JUnit ingest, idempotent storage, basic retries | Real playground history saved; repeated processing creates no duplicate effects; unsupported reports explicit |
+| **M3. Classification + PR comments** | 14–20 h | Dec 7 – 20 | Same-revision flake events, 3 verdicts, comment upsert/serialization, current-head safety and automated fixtures | **Local end-to-end resume-ready demo** with a real PR and intentional rerun flake |
+| **M4. First AWS deployment** | 20–30 h | Dec 21 – Jan 10 | Terraform ECR/ECS web+worker (stop-before-start worker deploys), RDS, broker, ALB/HTTPS, IAM/Secrets, OIDC CI/CD, CloudWatch, EventBridge Scheduler recovery task, cost controls | **Cloud-deployed resume-ready service**; can redeploy, trace a run, kill/recover a worker |
+| **M5. Hardening → core beta** | 10–16 h | Jan 11 – 24 | E2E failure tests, security checks, setup docs, external onboarding trial, fixes from first feedback if available | Technical beta released; installation demonstrated; external adoption not required to pass |
+| **M6. Post-beta iteration** | Not precommitted | After core beta | Additional workflows, better main-branch comparisons, scaling, observability and user-driven changes; AI only if justified | Prioritized by observed pain; own RFC/ADRs as warranted |
 
-**Acceptance tests (M5):** deterministic flips; partial re-runs; reordered
-deliveries; duplicate deliveries; worker crash mid-run; webhook delivery failure
-followed by recovery; two runs for one PR racing to update the comment; a
-rejected oversized artifact.
+**Resume reporting:** After M3, describe only completed, reproducible local
+end-to-end functionality. After M4, explicitly claim AWS/Terraform operations
+*only if* actually deployed and tested. Installation counts, uptime, accuracy
+and throughput appear on the resume only when measured. Use the actual status
+(`in development` or `deployed`) rather than projected features.
 
-**Decision checkpoint, Dec 6:** if real playground results aren't stored
-end-to-end by then, apply the cut list immediately and re-plan M3–M5.
+**M5 acceptance scenarios:** deterministic pass/fail flip on a full rerun and
+on a "Re-run failed jobs" attempt; a failed-jobs rerun in which the test job
+did not re-run (no new observation, section unchanged); insufficient history;
+no observed flake; malformed/oversized report; bad signature; duplicate
+delivery/task; crashed worker and recovered recorded job; worker stopped
+mid-job by a deploy; stale execution finishing after a newer one (final write
+discarded); commit-before-enqueue recovery; stale PR head; a `push` run for a
+PR's commit (no comment change); simulated concurrent comment creation/update;
+repository removal or installation suspension; missing report, and proper
+handling of unsupported matrix inputs.
 
-**Why deploy before detection:** the deployed pipeline collects real history
-while detection is being built, so M4 is developed against weeks of genuine data
-instead of an empty database. It also surfaces infrastructure problems early.
+**Checkpoint after M2 (around Dec 6):** if real reports cannot be stored
+end-to-end, stop expanding the architecture and re-plan M3–M5 based on actual
+blockers. Do not remove correctness or security just to meet a calendar date.
 
-Work happens on branches and merges through PRs; `main` is protected and
-CI-gated.
+**Ordering change:** Unlike rev. 4's deploy-before-detection plan, rev. 5
+builds one complete local GitHub→database→verdict→comment path *before* the AWS
+deploy. This makes the feature demonstrable sooner and prevents the cloud
+milestone from blocking a working resume project. Deployment and operating
+experience remain mandatory for the planned cloud checkpoint.
 
-## 11. Open questions
+Work on feature branches, review through PRs, keep `main` protected and CI-
+gated. Each milestone must include an acceptance demonstration and a short
+architecture review.
 
-1. Final name; check GitHub Marketplace availability before M3.
-2. LLM provider and model (decide in M6, by cost per explanation).
-3. Production broker: ElastiCache or a Redis container on Fargate (decide in
-   M3).
-4. `FLAKY_MIN_EVENTS` = 1 or 2 (revisit after the audit).
-5. Retention: 90 days, with every statistic showing its window and sample size.
+## 11. Open questions / decisions to validate
+
+1. GitHub App final name and exact Marketplace/install permission requirements.
+2. In M0, confirm that `workflow_run.head_sha` is the PR head for
+   `pull_request` runs, that rerun attempts test the same merge commit, and
+   how to tell whether the test-producing job ran in a failed-jobs rerun.
+3. Confirm artifact upload action version and JUnit XML behavior with pytest
+   (especially skipped/failed test commands).
+4. Before M4, select and price Redis broker topology (managed service versus
+   a carefully configured container), and set a monthly AWS spending cap.
+5. Confirm the EventBridge schedule interval, sweep safety margin, ECS stop
+   timeout and Celery soft/hard/visibility timeouts through crash tests,
+   rather than assigning them arbitrary values here. The sweep threshold must
+   exceed the hard time limit.
+6. Revisit 30-day retention, `FLAKY_MIN_EVENTS`, and verdict wording after
+   testing with real histories. Default 90-day retention is a tentative cap.
+7. Reconcile `DESIGN.md` to the decisions in §16 during M0, before
+   implementation of affected modules.
+8. Choose a webhook tunnel for local development and confirm it forwards the
+   raw request body unchanged (signature verification depends on it).
 
 ## 12. Questions for reviewers
 
-- Is the canonical-group table (§5.4) correct for every trigger listed?
-- Does naming-based provenance (§5.3) hold for partial re-runs, given the M0
-  spike results once they're filled in?
-- Are the claim lease, Celery's late acknowledgement and the Redis visibility
-  timeout configured so a running task is never duplicated (§5.2 steps 4 and 11)?
-- Does webhook recovery plus the sweep make G2 achievable, apart from the
-  documented 3-day limit?
-- Is the hour-based plan (§10) realistic, and is the cut list in the right
-  order?
+- Are supported reruns (full and failed-jobs) and PR merge-commit association
+  demonstrably safe? What should be skipped if the event payload is ambiguous?
+- Is the one-worker/DB-sweep recovery model with a conditional final write
+  sufficient for the beta, including stop-before-start worker deploys and
+  tasks killed at the hard time limit?
+- Is PR-scoped serialization plus marker lookup sufficient to prevent
+  duplicate/lost comments after retries or brief overlapping deployments?
+- Can the v1 XML/file limits be enforced without full streaming, including
+  decompression bombs and malicious archive paths?
+- Is the AWS bill tolerable for an always-available low-traffic product?
+- Are M2–M4 time ranges credible *including* manual learning and debugging?
+- Does the three-verdict system convey the evidence without implying
+  unproven safety or regression causality?
 
-## 13. Spike findings (M0)
+## 13. Spike findings (M0 — unverified)
 
-- **Artifacts across attempts:** does a full re-run or a "re-run failed jobs"
-  list earlier attempts' artifacts? Can the same artifact name be reused across
-  attempts? _TBD_
-- **Delayed processing:** when attempt 2 completes before attempt 1 is
-  processed, what does each attempt's artifact list return? _TBD_
-- **PR vs push:** `head_sha`, `head_repository` and `pull_requests` values for
-  same-repo PRs, fork PRs and pushes. _TBD_
-- **Delivery recovery:** cursor behavior of the App deliveries list; how a
-  redelivery appears (same GUID, `redelivery: true`). _TBD_
+- **Full rerun provenance:** when a workflow is rerun, which artifacts from
+  previous attempts appear in artifact listings? Can attempt-suffixed names
+  be reused safely? **_TBD_**
+- **"Re-run failed jobs" behavior:** in the playground, add a second job
+  (e.g. lint) and test two cases: (a) the test job failed and is re-run;
+  (b) only the other job failed, so the test job is not re-run. For each,
+  record the artifact list, the attempt's jobs (`/attempts/{n}/jobs` and each
+  job's `run_attempt`) and the webhook payload. Specify how to tell whether
+  the test job ran in the attempt; if no reliable signal exists, fall back to
+  full reruns only (R3). **_TBD_**
+- **PR versus push revision identity:** capture `workflow_run.head_sha`,
+  the PR's head/base SHAs, repository IDs, `pull_requests` (including on a
+  `push` run for a branch with an open PR), and print `$GITHUB_SHA` and
+  `git rev-parse HEAD` in each attempt of a re-run PR workflow. **_TBD_**
+- **Webhook validation:** capture sanitized genuine deliveries through the
+  local tunnel, verify signature processing and manual redelivery/dedupe
+  behavior. Automatic
+  discovery/redelivery is *not* in beta. **_TBD_**
+- **Artifact parser feasibility:** capture a small real pytest JUnit report
+  and confirm test names/outcomes and artifact upload action behavior.
+  **_TBD_**
 
 ## 14. Revision history
 
@@ -447,11 +629,26 @@ CI-gated.
   beta first, then AI; hour-based plan; deploy before detection.
 - **2026-10-21:** Rev. 4. Re-estimated the plan at ~80 h total; core beta
   moved to ~Jan 10.
+- **2026-10-29:** Proposed rev. 5. Reduced beta scope (F1–F6, T1–T7),
+  preserved backend/cloud core, revised guarantees, staged resume-ready
+  checkpoints, and flagged `DESIGN.md` reconciliation. Not yet approved.
+- **2026-10-30:** Rev. 5 draft updated after review: conditional final write
+  against stale executions; stop-before-start worker deploys; EventBridge
+  Scheduler recovery task confirmed; "Re-run failed jobs" supported when the
+  test job re-runs; `pull_request`-only comment rule; PR revision provenance
+  clarified; webhook tunnel and `DESIGN.md` reconciliation added to M0.
+  Still a draft pending review.
 
 ## 15. Review responses
 
-Round 1 reviewed rev. 1, before the Django switch. Every finding was accepted;
-#5 and #7 in a simplified form, and #16 by re-planning.
+Historical note: the table below documents resolutions accepted during the
+rev. 1–4 review cycle. **It is not a statement that all those mechanisms remain
+in v1.** Rev. 5 intentionally supersedes some resolutions: automated missed-
+webhook recovery (#4), advanced claim fencing (#9), streaming requirements
+(#11), stored failure output / AI (#6, #10, #12), cross-installation rate-limit
+coordination (#15), and the prior schedule (#16). See §16 for the definitive
+rev. 5 change list. Keep this table as audit history rather than rewriting the
+prior reviewers' findings.
 
 | # | Sev. | Finding | Resolution | Where |
 | --- | --- | --- | --- | --- |
@@ -471,3 +668,32 @@ Round 1 reviewed rev. 1, before the Django switch. Every finding was accepted;
 | 14 | Should fix | Observation identity, timestamps, foreign keys unclear | Aggregated counts per attempt; run start time for windows; foreign keys across runs, artifacts and results | §5.3, `DESIGN.md` §6 |
 | 15 | Should fix | Pagination and secondary rate limits missing | Full pagination, client-side filter, `Retry-After`, shared backoff, permission errors separate | §5.7 |
 | 16 | Should fix | Plan overcommitted | Hour-based plan at ~10 h/week; dashboard cut; AI after core beta; deploy before detection; Dec 6 checkpoint | §8, §10 |
+
+## 16. Rev. 5 scope changes and `DESIGN.md` reconciliation checklist
+
+The following is a **proposed revision**, not an approved architecture change.
+Historic review outcomes in §15 are preserved for traceability; this section
+controls how the v1 contract differs from rev. 4.
+
+| ID | Rev. 5 action | Required corresponding changes in `DESIGN.md` / implementation planning |
+| --- | --- | --- |
+| **F1** | Defer AI entirely | Remove AI route/tasks, explanation schema/cache, LLM cost targets, privacy/escape rules for generated content and M6 AI commitment |
+| **F2** | Defer default-branch comparisons | Remove old 4-verdict precedence, main baseline queries, `new failure` claims; specify 3 conservative verdicts and historical-count evidence |
+| **F3** | Narrow supported workflows | Single non-matrix test job/suite; full and failed-jobs reruns via suffix when the test job re-runs; "no new observation" outcome when it doesn't; reject ambiguous reruns/shards; keep per-workflow sections; comments from `pull_request` runs only |
+| **F4** | Defer automatic missed-webhook recovery | Remove GitHub delivery cursor/redelivery scheduler; retain DB stale-run sweep and manual redelivery when possible; narrow G2 claims |
+| **F5** | Do not retain failure output | Remove failure text fields, redaction pipeline and failure-output rendering; retain safe XML processing and test-identifier escaping |
+| **F6** | pytest onboarding first | Remove pre-beta Jest/Go setup acceptance; one verified pytest snippet |
+| **T1** | Keep AWS + Terraform, simplify topology | Web + one worker ECS service (min healthy 0% / max 100%) plus an EventBridge Scheduler schedule launching a short-lived recovery task; remove always-on Beat service/autoscaling/HA assumptions; add budget estimate |
+| **T2** | Keep queues, retries, idempotency, crash recovery | One worker concurrency 1; conditional claim recording `claimed_at`; conditional final write on the same claim; sweep threshold above the hard time limit; defer heartbeat leases and separate claim tokens; prove replay correctness |
+| **T3** | Simplify artifact processing | Bound download/decompression/memory/CPU and safe XML; full streaming implementation is optional; do not relax untrusted-input protections |
+| **T4** | Defer shared distributed throttling | Keep pagination, primary/secondary API-limit handling and retries; remove global Redis backoff coordinator |
+| **T5** | Simplify installation lifecycle | Keep installation state, revocation, suspensions and data deletion; defer eager full resync/token coordination; fail closed |
+| **T6** | Keep comment correctness, simplify concurrency | Single comment-write path with per-PR serialization, marker recovery, stale-head checks and race tests |
+| **T7** | Simplify observability | Keep structured CloudWatch logs, health checks, essential alerts/latency/backlog; defer Sentry, tracing, extensive dashboards |
+| **Schedule** | Local E2E before cloud | Replace rev. 4 M3/M4 ordering and total ~80-hour certainty with ranges and two truthful resume checkpoints |
+
+**Before coding against rev. 5:** review any schema, endpoint, acceptance
+criteria, configuration, Terraform resource or comment template in `DESIGN.md`
+that contradicts the table. Record substantive approved decisions in
+`DECISIONS.md` after acceptance. `ARCHITECTURE.md` should describe only the
+implementation that actually exists, not this proposed target state.
